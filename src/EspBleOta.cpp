@@ -131,14 +131,19 @@ OtaResult checkAndUpdate(const OtaConfig& cfg) {
 
 OtaResult otaOverWifi(const OtaConfig& cfg) {
     const bool hadBle = started();
-    // 必须先彻底释放 BLE:两个射频抢一根天线,不释放的话 OTA 慢到超时、BLE 也断。
-    if (hadBle) end();
+    // 让 BLE 安静下来(停广播 + 断连),把射频占用降下来。
+    //
+    // ⚠️ 这里**刻意不调 end()**。彻底 deinit 才是理论上最干净的做法,但
+    //    NimBLE-Arduino 1.4.x 的 deinit 在 Arduino core 3.x(IDF 5.x)上必 panic
+    //    —— 见 EspBleLink.h 里 end() 的注释与 docs/pitfalls.md A9。
+    //    实测 WiFi 与 BLE 共存足以跑完 OTA:局域网上 1.3MB 的镜像几秒钟就下完。
+    if (hadBle) quiesce();
 
     stage(cfg, "wifi", -1);
     if (!wifiConnectNvs(cfg.seedSsid, cfg.seedPassword, cfg.wifiTimeoutMs)) {
         stage(cfg, "failed", -1);
         WiFi.mode(WIFI_OFF);
-        if (hadBle) begin();   // 注意:用默认配置重启 BLE 会丢掉自定义 LinkConfig
+        if (hadBle) resume();
         return OtaResult::WifiFailed;
     }
 
@@ -147,7 +152,7 @@ OtaResult otaOverWifi(const OtaConfig& cfg) {
     // 只有失败/无更新才会走到这里(成功的话上面已经重启了)。
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
-    if (hadBle) begin();
+    if (hadBle) resume();
     return result;
 }
 

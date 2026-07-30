@@ -134,16 +134,47 @@ NimBLE-Arduino 1.4.3,MTU 协商到 517):
 | 连发 | 20 条连发,20/20 ack + 20/20 回显 |
 | 设备统计 | `rx_dropped=0  rx_oversize=0`,累计 6359B / 27 帧 |
 | 长度约束 | 2725B 的中文对象经 `fit_line` 压到 1843B,设备收到的字节数完全吻合 |
+| **OTA 端到端** | BLE 下发 `{"t":"cmd","cmd":"ota"}` → 设备静默 BLE → 连 WiFi → 拉 1.29MB 镜像 → 重启 → BLE 报 `fw:2` |
 
-**仍未验证的两项**:
+PlatformIO 侧已验证的部分:
 
-1. **PlatformIO 构建路径**(`library.json` + `lib_deps = symlink://../..` 与 git URL 形态)。
-   开发机拉不动 PlatformIO 的工具链包,上面的固件是用 arduino-cli 编的。
-   有条件的机器上跑一次:
-   ```bash
-   cd examples/echo && pio run
-   ```
-2. **OTA 端到端**(主机侧 `ota publish` / `ota serve` 已验,设备侧切 WiFi 拉固件那段没跑过)。
+| | |
+|---|---|
+| `library.json` | 通过 PlatformIO 的 manifest schema 校验 |
+| 两份清单共存 | PlatformIO 选 `library.json`,Arduino IDE 选 `library.properties`,不打架 |
+| `lib_deps = symlink://../..` | 解析成功,`NimBLE-Arduino@1.4.3` 作为传递依赖被自动带出 |
+| git URL 形态 | clone 后从目录安装 → 同样解析成功、依赖自动带出 |
+
+**仍未验证**:`pio run` 的完整编译链路。开发机拉不动 PlatformIO 的工具链包(见下),
+上面的固件是用 arduino-cli 编的。有条件的机器上跑一次 `cd examples/echo && pio run`。
+
+### 已知问题
+
+**`end()` 在 NimBLE-Arduino 1.4.x + Arduino core 3.x 上会 panic。**
+1.4.x 照 IDF 4.x 写的 HCI deinit 在 IDF 5.x 上返回 `ESP_ERR_INVALID_STATE`,
+随后死在 `heap_caps_free` 的断言里。**只有这一条路坏**,广播/连接/收发全正常。
+要临时让出射频用 `quiesce()`(`otaOverWifi()` 已经这么做了),要彻底释放就重启设备。
+详见 [pitfalls A9](docs/pitfalls.md)。
+
+`library.json` 里的 `export.include` **只在打包发布到 registry 时生效**;
+用 git URL 或本地目录安装时 PlatformIO 会整仓拷进 `.pio/libdeps/`,
+`host/`、`docs/` 也一起进去。不影响编译(`build.srcDir` 限定只编 `src/`),
+只是占点空间。
+
+### 用 arduino-cli 代替 PlatformIO 编译
+
+如果你的网络也拉不动 PlatformIO 的工具链包,而 Arduino ESP32 core 是现成的:
+
+```bash
+arduino-cli compile -b esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi \
+  --library /path/to/esp-ble-link \
+  --library /path/to/NimBLE-Arduino \
+  <你的 sketch 目录>
+```
+
+`library.properties` 就是为这条路准备的。注意板子参数必须与硬件一致 ——
+拿默认的 `FlashSize=4M,PSRAM=disabled` 烧 16MB+OPI PSRAM 的板子,
+设备会**静默不广播**,没有任何报错。
 
 ## License
 

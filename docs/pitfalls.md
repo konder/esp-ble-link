@@ -87,10 +87,54 @@ BLE 回调跑在 NimBLE 主机任务里。在回调里做任何耗时的事都�
 
 ### A7. OTA 龟速 / OTA 期间 BLE 断
 
-ESP32 的 BLE 和 WiFi **共用一颗 2.4G 射频**,同时开会互相拖垮。
-做 OTA 前必须 `espble::end()` 彻底释放 BLE。`otaOverWifi()` 封装了这个序列。
+ESP32 的 BLE 和 WiFi **共用一颗 2.4G 射频**。做 OTA 前先用 `espble::quiesce()`
+把 BLE 静下来(停广播 + 断连),`otaOverWifi()` 已经封装了这个序列。
 
-### A8. NimBLE 2.x 编译不过
+> 理论上更干净的做法是 `end()` 彻底 deinit,把射频完全让出来 —— 但那条路在
+> Arduino core 3.x 上会 panic(见 [A9](#a9))。实测**共存足够**:局域网上
+> 1.3MB 的镜像几秒钟就下完了。
+
+### A8. 收到 ota 指令后设备直接重启,固件没换
+
+**症状**:下发指令 → 设备重启 → 版本还是旧的,固件服务器的日志里**一条设备的请求都没有**
+(说明连 HTTP 那步都没走到)。串口上能看到:
+
+```
+E NimBLEAdvertising: Error enabling advertising; rc=30
+E NimBLEDevice: esp_nimble_hci_and_controller_deinit() failed with error: 259
+CORRUPT HEAP: Bad tail at 0x...
+assert failed: multi_heap_free
+```
+
+**成因**:拆 BLE 栈时会触发断连,断连回调里又去 `startAdvertising()` —— 在一个
+正在拆的协议栈上开广播,`rc=30` 失败,连带 deinit 也失败,最后堆损坏 panic。
+
+**解**:断连回调必须能区分「对端走了,该重新广播」和「是我们自己在拆栈」。
+本库用一个 `s_stopping` 标志,`quiesce()`/`end()` 进入前置位。
+**自己写外设固件的话这条一定要有** —— 只要你有任何「主动关掉 BLE」的路径就会撞上。
+
+### A9. ★ NimBLE-Arduino 1.4.x 的 `deinit()` 在 Arduino core 3.x 上必 panic
+
+```
+E NimBLEDevice: esp_nimble_hci_and_controller_deinit() failed with error: 259
+assert failed: heap_caps_free heap_caps_base.c:75
+               (free() target pointer is outside heap areas)
+```
+
+`259` = `ESP_ERR_INVALID_STATE`。**成因**:NimBLE-Arduino 1.4.x 是照 ESP-IDF 4.x 写的,
+Arduino ESP32 core 3.x 底下是 IDF 5.x,HCI/controller 的 deinit API 变了。
+
+**要命的地方是它只坏这一条路**:广播、连接、收发、重连全都正常,单元测试和日常
+使用一点问题都没有 —— 只有「主动关掉 BLE」时才炸。所以很容易到了要做 OTA
+那天才发现。
+
+**解**:别调 `end()`。用 `quiesce()`(停广播 + 断连,保留协议栈),
+需要彻底干净的射频状态就重启设备。本库的 `otaOverWifi()` 已经这么做了。
+
+如果你的项目非要真正的 deinit,那就得上 NimBLE-Arduino 2.x —— 但 2.x 改了回调
+签名,本库尚未适配(见 [A10](#a10))。
+
+### A10. NimBLE 2.x 编译不过
 
 2.x 改了回调签名(`onWrite(NimBLECharacteristic*, NimBLEConnInfo&)`)。
 本库当前只支持 `h2zero/NimBLE-Arduino@^1.4.2`。

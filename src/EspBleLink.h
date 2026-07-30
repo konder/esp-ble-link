@@ -110,9 +110,26 @@ using ConnectionCallback = void (*)(bool connected);
 // 初始化并开始广播。重复调用会先 end()。失败返回 false(通常是内存不够)。
 bool begin(const LinkConfig& cfg = LinkConfig());
 
-// 停止并彻底释放 BLE,把 2.4G 射频让给 WiFi。做 OTA 前必须调
-// (ESP32 的 BLE 和 WiFi 共用射频,同时开会互相拖垮)。
+// 停止并彻底释放 BLE(NimBLEDevice::deinit)。
+//
+// ⚠️ **在 NimBLE-Arduino 1.4.x + Arduino ESP32 core 3.x 上这个函数会 panic。**
+//    1.4.x 是照 IDF 4.x 写的,core 3.x 底下是 IDF 5.x,HCI deinit 的 API 变了:
+//    `esp_nimble_hci_and_controller_deinit() failed with error: 259`
+//    (ESP_ERR_INVALID_STATE),紧接着死在 heap_caps_free 的断言上。
+//    正常收发完全不受影响 —— **只有拆栈这条路是坏的**。
+//    要临时让出射频请用 quiesce();要彻底释放请重启设备。
+//    详见 docs/pitfalls.md A9。
 void end();
+
+// 让 BLE 安静下来:停广播 + 断开对端,但**保留协议栈**。
+//
+// 这是 end() 在 core 3.x 上的安全替代品。做 OTA 之类要用 WiFi 的事情之前调它:
+// 射频占用降下来了(不再广播、没有连接事件),又不碰那条会 panic 的 deinit 路径。
+// 之后调 resume() 恢复广播。
+void quiesce();
+
+// 从 quiesce() 恢复:重新开始广播。
+void resume();
 
 // 是否已初始化(begin 成功且未 end)。
 bool started();

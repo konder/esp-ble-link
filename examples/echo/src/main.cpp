@@ -78,13 +78,8 @@ static void runOta() {
     };
 
     // 成功的话设备直接重启,下面这些不会执行。
+    // 失败时 otaOverWifi 会自己 resume() 回广播 —— 配置还是原来那份,不用重新 begin。
     espble::OtaResult r = espble::otaOverWifi(cfg);
-
-    // otaOverWifi 内部失败时已经把 BLE 拉回来了,但用的是**默认** LinkConfig。
-    // 我们有自定义配置(设备名),所以重新 begin 一次自己的。
-    espble::LinkConfig link;
-    link.deviceName = ECHO_DEVICE_NAME;
-    espble::begin(link);
 
     const char* why = "unknown";
     switch (r) {
@@ -133,7 +128,9 @@ void loop() {
     if (now - g_lastStatsMs >= 30000) {
         g_lastStatsMs = now;
         espble::LinkStats s = espble::stats();
-        String t = "{\"t\":\"stats\",\"rx_bytes\":" + String(s.rxBytes) +
+        // fw 放第一个:OTA 之后靠它确认设备真的换了固件(串口未必读得到)
+        String t = "{\"t\":\"stats\",\"fw\":" + String(FW_VERSION) +
+                   ",\"rx_bytes\":" + String(s.rxBytes) +
                    ",\"rx_dropped\":" + String(s.rxDroppedBytes) +
                    ",\"rx_frames\":" + String(s.rxFrames) +
                    ",\"rx_oversize\":" + String(s.rxOversize) +

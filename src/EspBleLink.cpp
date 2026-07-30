@@ -15,11 +15,16 @@ namespace {
 LinkConfig s_cfg;
 bool       s_started = false;
 
+// end() 期间置位。onDisconnect 靠它区分「对端走了,该重新广播」和
+// 「是我们自己在拆栈,别碰它」—— 见 end() 里的成因注释。
+volatile bool s_stopping = false;
+
 NimBLEServer*         s_server = nullptr;
 NimBLECharacteristic* s_tx     = nullptr;
 
-volatile bool     s_connected = false;
-volatile uint16_t s_mtu       = 0;
+volatile bool     s_connected  = false;
+volatile uint16_t s_mtu        = 0;
+volatile uint16_t s_connHandle = 0;
 
 ConnectionCallback s_connCb = nullptr;
 
@@ -78,6 +83,7 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* server, ble_gap_conn_desc* desc) override {
         s_connected = true;
+        s_connHandle = desc->conn_handle;
         s_mtu = server->getPeerMTU(desc->conn_handle);
         s_stats.connects++;
         // ⚠️ 这里**没有** updateConnParams,将来也不要加(见 EspBleLink.h 纪律 2)。
@@ -91,6 +97,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         // 丢掉半截帧,别让残字节污染下一次连接。
         s_ringHead = s_ringTail = 0;
         s_assembly = "";
+        // ⚠️ 拆栈途中绝不能再开广播。end() 会先断连,这个回调随之触发;
+        //    此时 startAdvertising() 会 rc=30 失败,进而让 deinit 也失败,
+        //    最后堆损坏 panic。成因见 docs/pitfalls.md A8。
+        if (s_stopping) return;
         server->startAdvertising();
         if (s_connCb) s_connCb(false);
     }
@@ -101,8 +111,11 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
 };
 
-RxCallbacks*     s_rxCallbacks     = nullptr;
-ServerCallbacks* s_serverCallbacks = nullptr;
+// 回调对象做成静态单例而不是 new/delete。
+// deinit 失败时协议栈可能还留着指向它们的指针,那时 delete 就是 use-after-free;
+// 而反复 begin/end 又不能泄漏。静态单例把这两个问题一起消掉。
+RxCallbacks     s_rxCallbacks;
+ServerCallbacks s_serverCallbacks;
 
 // dBm → NimBLE 的功率档位枚举(硬件只有这 8 档,取最接近的)。
 esp_power_level_t toPowerLevel(int8_t dbm) {
@@ -149,6 +162,7 @@ void notifyChunk(const uint8_t* p, size_t n) {
 bool begin(const LinkConfig& cfg) {
     if (s_started) end();
     s_cfg = cfg;
+    s_stopping = false;      // 上一轮 end() 若中途失败可能留着,别让新连接一上来就不广播
 
     if (s_cfg.rxRingBytes < 64) s_cfg.rxRingBytes = 64;
     s_ring = (uint8_t*)malloc(s_cfg.rxRingBytes);
@@ -168,16 +182,13 @@ bool begin(const LinkConfig& cfg) {
     NimBLEDevice::setPower(toPowerLevel(s_cfg.txPowerDbm));
     NimBLEDevice::setMTU(s_cfg.mtu);   // 只是「允许协商到这么大」,实际由中心定
 
-    s_serverCallbacks = new ServerCallbacks();
-    s_rxCallbacks     = new RxCallbacks();
-
     s_server = NimBLEDevice::createServer();
-    s_server->setCallbacks(s_serverCallbacks);
+    s_server->setCallbacks(&s_serverCallbacks);
 
     NimBLEService* svc = s_server->createService(svcUuid);
     NimBLECharacteristic* rx = svc->createCharacteristic(
         rxUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
-    rx->setCallbacks(s_rxCallbacks);
+    rx->setCallbacks(&s_rxCallbacks);
     s_tx = svc->createCharacteristic(txUuid, NIMBLE_PROPERTY::NOTIFY);
     svc->start();
 
@@ -195,20 +206,52 @@ bool begin(const LinkConfig& cfg) {
 
 void end() {
     if (!s_started) return;
+
+    // 拆栈顺序是有讲究的,乱来会堆损坏 panic(docs/pitfalls.md A8):
+    //   ① 先置 stopping —— 后面主动断连会触发 onDisconnect,它必须知道
+    //      「这次别重新广播」。在正在拆的协议栈上 startAdvertising() 会 rc=30 失败,
+    //      连带 deinit 也失败,最后死在 multi_heap_free 的断言上。
+    //   ② 停广播、断开对端,给协议栈时间把断连事件跑完。
+    //   ③ 最后才 deinit。
+    s_stopping = true;
+    NimBLEDevice::stopAdvertising();
+    if (s_connected && s_server) {
+        s_server->disconnect(s_connHandle);
+        for (int i = 0; i < 20 && s_connected; i++) delay(10);   // 至多等 200ms
+    }
+    delay(20);
     NimBLEDevice::deinit(true);
+
     s_server = nullptr;
     s_tx     = nullptr;
     s_connected = false;
     s_mtu = 0;
-    // NimBLE 的 deinit 会销毁 server/service/characteristic,但 callbacks 对象是
-    // 我们 new 出来的,由我们负责。
-    delete s_serverCallbacks; s_serverCallbacks = nullptr;
-    delete s_rxCallbacks;     s_rxCallbacks     = nullptr;
+    s_stopping = false;
     free(s_ring); s_ring = nullptr;
     s_ringCap = 0;
     s_ringHead = s_ringTail = 0;
     s_assembly = "";
     s_started = false;
+}
+
+void quiesce() {
+    if (!s_started) return;
+    // 只做「安全」的两件事:停广播、断开对端。绝不碰 deinit —— 那条路在
+    // NimBLE 1.4.x + core 3.x 上必 panic(见 end() 的注释)。
+    s_stopping = true;          // 断连回调别去重新广播
+    NimBLEDevice::stopAdvertising();
+    if (s_connected && s_server) {
+        s_server->disconnect(s_connHandle);
+        for (int i = 0; i < 20 && s_connected; i++) delay(10);
+    }
+    s_ringHead = s_ringTail = 0;
+    s_assembly = "";
+}
+
+void resume() {
+    if (!s_started) return;
+    s_stopping = false;
+    NimBLEDevice::startAdvertising();
 }
 
 bool started()   { return s_started; }
