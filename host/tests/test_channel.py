@@ -19,8 +19,12 @@ class FakeLink:
         self.queued = []      # send_soon
         self.blocking = []    # send_blocking(补推走这条)
         self.cleared = 0
+        self.started = False
         self.on_connect = None
         self.keepalive_provider = None
+
+    def start(self):
+        self.started = True
 
     def send_soon(self, line, *, queue_while_offline=False):
         if not queue_while_offline and not self.connected:
@@ -53,6 +57,21 @@ def channel(link):
 def test_channel_wires_itself_into_the_link(link, channel):
     assert link.on_connect == channel._on_connect
     assert link.keepalive_provider == channel._keepalive_line
+
+
+def test_link_started_only_after_callbacks_are_wired(link):
+    """顺序要紧:先接钩子再启动。反过来的话链路可能在 on_connect 挂上之前
+    就连上了,首次连接的 retained/history 补推就漏了。"""
+    order = []
+    link.start = lambda: order.append("start")
+
+    class Probe(RetainedChannel):
+        def _on_connect(self, lnk):
+            order.append("on_connect")
+
+    probe = Probe(link)
+    assert order == ["start"]                    # 构造时就启动了
+    assert link.on_connect == probe._on_connect  # 而且钩子已经在位
 
 
 def test_retained_is_pushed_immediately(link, channel):
