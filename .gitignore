@@ -1,0 +1,19 @@
+.pio/
+.build/
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# OTA 产物目录(espble ota publish 的默认落点)
+fw/
+
+# 设备凭据:模板进仓库,真值不进
+**/secrets.h
+!**/secrets.h.example
+
+.DS_Store

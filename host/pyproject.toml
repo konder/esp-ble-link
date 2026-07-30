@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "espble"
+version = "0.1.0"
+description = "macOS BLE central for ESP32 NUS devices: native Swift helper + process-level recovery + message semantics"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "konder" }]
+keywords = ["ble", "corebluetooth", "esp32", "nus", "macos"]
+classifiers = [
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+]
+# 刻意零运行时依赖:只用标准库。多一个依赖就多一个在 launchd 环境里
+# 解析不到的风险,而这个包必须能在 /usr/bin/python3 上裸跑。
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+espble = "espble.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/konder/esp-ble-link"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["espble*"]
+
+[tool.setuptools.package-data]
+espble = ["native/*.swift", "native/*.tmpl", "native/*.sh"]

@@ -1,0 +1,23 @@
+{
+  "name": "EspBleLink",
+  "version": "0.1.0",
+  "description": "ESP32 BLE peripheral link layer (Nordic UART Service) with newline-delimited framing, plus WiFi-mode OTA. Designed to pair with the espble macOS central helper.",
+  "keywords": ["ble", "nimble", "nus", "esp32", "ota"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/konder/esp-ble-link.git"
+  },
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "headers": ["EspBleLink.h", "EspBleOta.h"],
+  "dependencies": {
+    "h2zero/NimBLE-Arduino": "^1.4.2"
+  },
+  "export": {
+    "include": ["src", "examples", "LICENSE", "README.md"]
+  },
+  "build": {
+    "srcDir": "src"
+  }
+}
