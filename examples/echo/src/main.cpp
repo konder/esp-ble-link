@@ -138,7 +138,8 @@ void loop() {
                    ",\"rx_frames\":" + String(s.rxFrames) +
                    ",\"rx_oversize\":" + String(s.rxOversize) +
                    ",\"tx_frames\":" + String(s.txFrames) +
-                   ",\"mtu\":" + String(espble::peerMtu()) +
+                   ",\"tx_chunks\":" + String(s.txChunks) +
+                                      ",\"mtu\":" + String(espble::peerMtu()) +
                    ",\"uptime\":" + String(now / 1000) + "}";
         espble::notify(t);
     }

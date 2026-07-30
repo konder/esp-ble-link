@@ -41,6 +41,10 @@ SemaphoreHandle_t s_rxSignal = nullptr;
 
 LinkStats s_stats;
 
+// notify 拼「最后一片 + 分隔符」用的暂存区。只有主循环碰它。
+// 256 覆盖 notifyChunkMax 的默认值;配得更大时最后的分隔符会单独发一片,不影响正确性。
+uint8_t s_txScratch[256];
+
 inline size_t ringNext(size_t i) { return (i + 1) % s_ringCap; }
 
 // 只在 NimBLE 主机任务里调用:memcpy 进环,立刻返回。不做任何解析。
@@ -116,11 +120,28 @@ esp_power_level_t toPowerLevel(int8_t dbm) {
     return best;
 }
 
-// 单片 notify 能带多少字节:ATT_MTU - 3 字节的 ATT 头。
+// 单片 notify 能带多少字节:ATT_MTU - 3 字节的 ATT 头,再夹到 notifyChunkMax。
 // 未协商到(部分中心不主动交换 MTU)时退回 BLE 规定的默认 23。
+//
+// ⚠️ 上限不是理论值而是实测值。取满 MTU-3(协商到 517 时是 514)连续推几片,
+//    NimBLE 的 mbuf 池会被打空 —— 见 LinkConfig::notifyChunkMax 的注释。
 size_t notifyChunkSize() {
     uint16_t mtu = s_mtu ? s_mtu : 23;
-    return mtu > 3 ? size_t(mtu - 3) : 20;
+    size_t byMtu = mtu > 3 ? size_t(mtu - 3) : 20;
+    size_t cap = s_cfg.notifyChunkMax ? s_cfg.notifyChunkMax : byMtu;
+    return byMtu < cap ? byMtu : cap;
+}
+
+// 推一片。
+//
+// ⚠️ NimBLE-Arduino 1.4.x 的 notify() 返回 void —— **协议栈吃不下这一片时我们
+//    收不到任何信号**。所以这里不能靠重试兜底,只能靠「别把它撑爆」:
+//    分片保守(notifyChunkMax)+ 片间留出冲刷时间(notifyChunkDelayMs)。
+//    这也是为什么 notifyChunkMax 的默认值是实测出来的 180 而不是理论上的 MTU-3。
+void notifyChunk(const uint8_t* p, size_t n) {
+    s_tx->setValue(p, n);
+    s_tx->notify();
+    s_stats.txChunks++;
 }
 
 }  // namespace
@@ -245,30 +266,24 @@ bool notify(const uint8_t* data, size_t len) {
         size_t n = len - sent;
         if (n > chunk) n = chunk;
         // 最后一片如果还有空位,把分隔符捎上,省一次 notify。
-        bool tailFits = (sent + n == len) && needDelimiter && (n < chunk);
+        bool tailFits = (sent + n == len) && needDelimiter && (n < chunk)
+                        && (n + 1 <= sizeof(s_txScratch));
         if (tailFits) {
-            uint8_t buf[517];
-            size_t copy = n < sizeof(buf) - 1 ? n : sizeof(buf) - 1;
-            memcpy(buf, data + sent, copy);
-            buf[copy] = (uint8_t)s_cfg.delimiter;
-            s_tx->setValue(buf, copy + 1);
-        } else {
-            s_tx->setValue(data + sent, n);
+            memcpy(s_txScratch, data + sent, n);
+            s_txScratch[n] = (uint8_t)s_cfg.delimiter;
+            notifyChunk(s_txScratch, n + 1);
+            s_stats.txFrames++;
+            return true;
         }
-        s_tx->notify();
-        s_stats.txChunks++;
+        notifyChunk(data + sent, n);
         sent += n;
-        if (tailFits) { s_stats.txFrames++; return true; }
-        // 片间让出 CPU,给协议栈时间把这一片冲出去。连续猛推会把 NimBLE 的
-        // mbuf 池打空,表现为 notify 静默失败。
-        if (sent < len) delay(4);
+        // 片间让出 CPU,给协议栈把这一片冲出去。省掉它就是长消息变残帧的原因。
+        if (sent < len) delay(s_cfg.notifyChunkDelayMs);
     }
 
     if (needDelimiter) {
         uint8_t d = (uint8_t)s_cfg.delimiter;
-        s_tx->setValue(&d, 1);
-        s_tx->notify();
-        s_stats.txChunks++;
+        notifyChunk(&d, 1);
     }
     s_stats.txFrames++;
     return true;

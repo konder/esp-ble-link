@@ -67,6 +67,18 @@ struct LinkConfig {
     // 帧分隔符。两侧必须一致。
     char delimiter = '\n';
 
+    // notify 单片上限。**别改大。**
+    // 实测:按 MTU-3(协商到 517 时就是 514)连续推几片,NimBLE 的 mbuf 池会被打空,
+    // notify() 开始返回 false,中枢那边收到的是残帧 —— 现象是长消息回来变成
+    // 一段乱码,而短消息一切正常。180 是 CodeBuddy 系固件用了很久的保守值。
+    // 实际分片长度 = min(ATT_MTU - 3, notifyChunkMax)。
+    size_t notifyChunkMax = 180;
+
+    // 多片 notify 的片间停顿,给协议栈时间把上一片冲出去。
+    // ⚠️ NimBLE-Arduino 1.4.x 的 notify() 返回 void —— 协议栈吃不下时**我们收不到
+    //    任何信号**,没法重试。所以这个停顿不是优化,是正确性的一部分。
+    uint16_t notifyChunkDelayMs = 4;
+
     // 发射功率(dBm)。硬件档位是 -12/-9/-6/-3/0/+3/+6/+9,会取最接近的一档。
     int8_t txPowerDbm = 9;
 
@@ -85,6 +97,8 @@ struct LinkStats {
     uint32_t rxOversize     = 0;   // 超过 maxFrameBytes 被整条丢弃的帧
     uint32_t txFrames       = 0;   // notify 出去的帧
     uint32_t txChunks       = 0;   // notify 实际分了多少片
+                                   // (没有 txDropped —— NimBLE 1.4.x 的 notify()
+                                   //  返回 void,发失败我们根本不知道)
     uint32_t connects       = 0;   // 累计建连次数(排查 flapping)
     uint32_t disconnects    = 0;
 };

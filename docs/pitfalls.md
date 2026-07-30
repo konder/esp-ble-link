@@ -63,12 +63,34 @@ BLE 回调跑在 NimBLE 主机任务里。在回调里做任何耗时的事都�
 上次连接遗留在环形缓冲里的半截帧,和新连接的首帧拼在了一起。
 `onDisconnect` 里必须清 `head`/`tail` 和组帧缓冲 —— `EspBleLink` 已经做了。
 
-### A6. OTA 龟速 / OTA 期间 BLE 断
+### A6. ★ 短消息 notify 正常,长消息回来是一段乱码
+
+**症状极具迷惑性**:单片能装下的消息(几十上百字节)完美往返;超过一片的长消息,
+中枢收到的是一段**残帧** —— 开头半个汉字、JSON 解析失败,而且常伴随几条内容
+一模一样的旧帧被重复吐出来。设备侧的 `rxDroppedBytes`/`rxOversize` **全是 0**,
+看起来一切正常,所以很容易往中枢的重组逻辑上找,找不到。
+
+**成因**:notify 分片取满了 `ATT_MTU - 3`。MTU 协商到 517 时那就是 514 字节一片,
+连推几片会把 NimBLE 的 mbuf 池打空,后面的片**静默丢弃**。
+
+**为什么发现不了**:NimBLE-Arduino 1.4.x 的 `NimBLECharacteristic::notify()`
+**返回 `void`** —— 协议栈吃不下时不给任何信号。所以这里没法靠检查返回值重试,
+只能靠不把它撑爆。这也是本库没有 `txDropped` 计数器的原因:统计不到的东西
+不该假装能统计。
+
+**解**:`LinkConfig::notifyChunkMax` 默认 180(实测值,不是理论值),
+片间 `notifyChunkDelayMs = 4`。**别把 notifyChunkMax 调大**,那个「MTU 都协商到
+517 了不用白不用」的直觉正是这个 bug 的来源。
+
+实测(M5PaperS3 / NimBLE 1.4.3 / MTU 517):改成 180 之后,21B / 198B / 696B /
+1398B / 1839B 五种长度(1~11 片)全部逐字节一致,连发 20 条 20/20 无丢失。
+
+### A7. OTA 龟速 / OTA 期间 BLE 断
 
 ESP32 的 BLE 和 WiFi **共用一颗 2.4G 射频**,同时开会互相拖垮。
 做 OTA 前必须 `espble::end()` 彻底释放 BLE。`otaOverWifi()` 封装了这个序列。
 
-### A7. NimBLE 2.x 编译不过
+### A8. NimBLE 2.x 编译不过
 
 2.x 改了回调签名(`onWrite(NimBLECharacteristic*, NimBLEConnInfo&)`)。
 本库当前只支持 `h2zero/NimBLE-Arduino@^1.4.2`。

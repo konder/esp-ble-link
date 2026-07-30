@@ -123,22 +123,27 @@ channel.publish({"t": "ev", "msg": "构建完成"})
 | 扫描超时看门狗 | 连跑三次,均在 `scan_timeout + 1s` 自我终结 |
 | OTA publish / serve | 端到端 `curl` 过 `/fw/version` 与 `/fw/current.bin` |
 
-**固件侧尚未经过编译器检验** —— 开发机上没装 PlatformIO。跑之前先过一遍:
+固件侧已在真机验证(M5PaperS3 / ESP32-S3,Arduino ESP32 core 3.2.1 +
+NimBLE-Arduino 1.4.3,MTU 协商到 517):
 
-```bash
-cd examples/echo
-pio run                       # 两个 env 都编译:esp32s3 / stamps3
-```
+| | |
+|---|---|
+| 编译 | `arduino-cli compile -b esp32:esp32:esp32s3` 零警告 |
+| 广播与建连 | 中枢扫到 `EspBleEcho` 并完成订阅 |
+| 收发往返 | 21B / 198B / 696B / 1398B / 1839B(1~11 片)全部**逐字节一致** |
+| 连发 | 20 条连发,20/20 ack + 20/20 回显 |
+| 设备统计 | `rx_dropped=0  rx_oversize=0`,累计 6359B / 27 帧 |
+| 长度约束 | 2725B 的中文对象经 `fit_line` 压到 1843B,设备收到的字节数完全吻合 |
 
-重点会暴露出来的是 NimBLE 1.4 的回调签名、`httpUpdate.onProgress` 的类型,
-以及 `lib_deps = symlink://../..` 能否解析。再验一次 git URL 形态:
+**仍未验证的两项**:
 
-```bash
-# 把 examples/echo/platformio.ini 的 lib_deps 换成 git URL 再跑一次
-lib_deps = https://github.com/konder/esp-ble-link.git
-```
-
-真机回环见 `examples/echo/run.sh`(需要一块空闲 ESP32-S3,且必须在 GUI 会话里跑)。
+1. **PlatformIO 构建路径**(`library.json` + `lib_deps = symlink://../..` 与 git URL 形态)。
+   开发机拉不动 PlatformIO 的工具链包,上面的固件是用 arduino-cli 编的。
+   有条件的机器上跑一次:
+   ```bash
+   cd examples/echo && pio run
+   ```
+2. **OTA 端到端**(主机侧 `ota publish` / `ota serve` 已验,设备侧切 WiFi 拉固件那段没跑过)。
 
 ## License
 

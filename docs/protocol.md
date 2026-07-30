@@ -22,8 +22,11 @@
 
 - **中心 → 外设**:整行按 `min(180, maximumWriteValueLength)` 分片,
   逐片 `.withResponse` 写,**下一片只在收到 ATT ack 后发**。
-- **外设 → 中心**:按协商 `ATT_MTU - 3` 分片 notify,片间 `delay(4)`;
-  自动补分隔符。
+- **外设 → 中心**:按 `min(ATT_MTU - 3, notifyChunkMax)` 分片 notify,
+  片间 `delay(notifyChunkDelayMs)`;自动补分隔符。
+  ⚠️ `notifyChunkMax` 默认 **180**,不是 MTU-3。取满会打空 NimBLE 的 mbuf 池导致
+  静默丢片,而 1.4.x 的 `notify()` 返回 void,丢了也没人告诉你 ——
+  见 [pitfalls A6](pitfalls.md#a6)。
 
 外设侧把收到的字节推进环形缓冲,由主循环按分隔符重组。
 
