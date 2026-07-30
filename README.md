@@ -109,6 +109,37 @@ channel.publish({"t": "ev", "msg": "构建完成"})
 
 早期。协议与 API 可能还会变。
 
+### 验证到哪了
+
+主机侧已验证:
+
+| | |
+|---|---|
+| 48 个单测 | `cd host && PYTHONPATH=. python3 -m pytest tests -q` |
+| pip 安装形态与 CLI 入口 | `pip install ./host` → `espble --help` |
+| Swift helper 编译 + adhoc 签名 | `espble build-helper …`,bundle 结构/plist/codesign 均核对过 |
+| bundle id 三道护栏 | 本地登记表、上游 id 黑名单、名字含空格,均按预期拒绝 |
+| helper 真机扫描 | 实际扫到周围设备,事件序列 `central_created → central_state:5 → scan_started` 正常 |
+| 扫描超时看门狗 | 连跑三次,均在 `scan_timeout + 1s` 自我终结 |
+| OTA publish / serve | 端到端 `curl` 过 `/fw/version` 与 `/fw/current.bin` |
+
+**固件侧尚未经过编译器检验** —— 开发机上没装 PlatformIO。跑之前先过一遍:
+
+```bash
+cd examples/echo
+pio run                       # 两个 env 都编译:esp32s3 / stamps3
+```
+
+重点会暴露出来的是 NimBLE 1.4 的回调签名、`httpUpdate.onProgress` 的类型,
+以及 `lib_deps = symlink://../..` 能否解析。再验一次 git URL 形态:
+
+```bash
+# 把 examples/echo/platformio.ini 的 lib_deps 换成 git URL 再跑一次
+lib_deps = https://github.com/konder/esp-ble-link.git
+```
+
+真机回环见 `examples/echo/run.sh`(需要一块空闲 ESP32-S3,且必须在 GUI 会话里跑)。
+
 ## License
 
 MIT
