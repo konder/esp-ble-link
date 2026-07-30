@@ -9,8 +9,10 @@
         session_dir="~/.config/myapp/ble-session",
         device_name="MyDevice",
     )
-    link = BleLink(device, on_notification=print)
-    channel = RetainedChannel(link)
+    # autostart=False:让 RetainedChannel 先把回调接上再启动,
+    # 否则首次连接可能在 on_connect 挂上之前就完成了,补推就漏了。
+    link = BleLink(device, on_notification=print, autostart=False)
+    channel = RetainedChannel(link)      # 构造时会启动链路
 
     channel.set_retained("state", {"t": "state", "rev": 7, "battery": 82})
     channel.publish({"t": "ev", "kind": "done", "msg": "构建完成"})

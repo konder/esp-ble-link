@@ -51,6 +51,11 @@ class RetainedChannel:
 
         link.on_connect = self._on_connect
         link.keepalive_provider = self._keepalive_line
+        # 接好回调**之后**才启动监护线程。反过来的话,链路可能在 on_connect
+        # 被挂上之前就连上了,首次连接就错过补推。
+        # 所以配套的 BleLink 应当用 autostart=False 构造;
+        # 已经在跑的 link 调 start() 是幂等的,不会起第二个线程。
+        link.start()
 
     # ---- 对外 ----
 
