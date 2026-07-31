@@ -158,7 +158,50 @@ C++ 标识符。**宏不认 namespace** —— 哪怕那个声明写在 `namespa
 
 (这条是 m5work 迁移时真炸出来的,不是纸上推演。)
 
-### A11. NimBLE 2.x 编译不过
+### A11. ★ 烧完就再也不运行:每次复位都进 `boot:0x0 (DOWNLOAD)`
+
+**症状**:烧录成功、hash 校验通过,但设备就是不跑固件 —— 不广播、不上 WiFi、屏幕不动。
+串口里每次都是:
+
+```
+rst:0x15 (USB_UART_CHIP_RESET),boot:0x0 (DOWNLOAD(USB/UART0))
+waiting for download
+```
+
+`esptool --after hard_reset`、`esptool run`、手工脉冲 EN,全都没用。
+
+**判别(不复位就能测)**:
+```bash
+esptool --port <口> --before no_reset --after no_reset --connect-attempts 1 chip_id
+#   同步成功 → 芯片正停在 ROM 下载器里
+#   同步失败 → 芯片在跑应用代码
+```
+
+**定位到底是不是 GPIO0 被按住**,读两个寄存器(ESP32-S3):
+```bash
+esptool ... read_mem 0x60004038   # GPIO_STRAP_REG:复位那一刻锁存的 strapping
+esptool ... read_mem 0x6000403C   # GPIO_IN_REG:GPIO0 当前电平(bit0)
+```
+实测拿到 `strap=0x00000000` 但 `in=0x3c000009`(bit0=1)—— 也就是
+**GPIO0 现在是高的,只在复位瞬间被拉低**。那就不是 BOOT 键卡住,而是板上的
+自动下载电路:主机每次经 DTR/RTS 复位,都会顺带把 GPIO0 拉低,而 esptool 的
+`hard_reset` 在这个板子/适配器组合上释放 GPIO0 的时序不对。
+
+**解:让芯片自己内部复位,绕开那条电路。**
+```bash
+esptool --port <口> --before no_reset --after watchdog_reset flash_id
+```
+`watchdog_reset` 用 RTC 看门狗从芯片内部触发复位,不碰 EN/GPIO0,strapping 就会读到
+上拉的高电平,正常启动。
+
+⚠️ **这个选项 esptool 4.7 才加,而 4.7.0 本身还没有**(`--after` 只有
+hard_reset/soft_reset/no_reset/no_reset_stub)。PlatformIO 捆绑的往往就是老版本,
+装个新的到临时 venv 即可:`python3 -m venv /tmp/espt && /tmp/espt/bin/pip install -U esptool`。
+
+顺带一提:**在这块板上「打开串口」这个动作本身就会触发上述复位**,所以
+「读串口看看它在干嘛」会把它敲回下载模式。判活优先用 BLE 或上面那个 no_reset 探针。
+
+### A12. NimBLE 2.x 编译不过
 
 2.x 改了回调签名(`onWrite(NimBLECharacteristic*, NimBLEConnInfo&)`)。
 本库当前只支持 `h2zero/NimBLE-Arduino@^1.4.2`。
