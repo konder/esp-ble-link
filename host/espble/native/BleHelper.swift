@@ -430,6 +430,9 @@ private struct MenuConfig {
     let namePrefix: String?
     let service: CBUUID
     let sessionDir: URL?
+    // BleHub 模式:注册表列出所有设备,每台的链路状态在 <sessionRoot>/<id>/events.jsonl
+    let registryPath: URL?
+    let sessionRoot: URL?
 
     static func parse() -> MenuConfig {
         var args = Array(CommandLine.arguments.dropFirst())
@@ -448,16 +451,38 @@ private struct MenuConfig {
         let prefix = take("--name-prefix") ?? plist("ESPBLENamePrefix")
         let svc = take("--service") ?? plist("ESPBLEService") ?? defaultService
         let sess = take("--watch-session") ?? plist("ESPBLESessionDir")
+        let reg  = take("--registry") ?? plist("ESPBLERegistry")
+            ?? "~/.config/espble/devices.json"
+        let root = take("--session-root") ?? plist("ESPBLESessionRoot")
+            ?? "~/.config/espble/sessions"
+        func url(_ s: String?) -> URL? {
+            guard let s, !s.isEmpty else { return nil }
+            return URL(fileURLWithPath: (s as NSString).expandingTildeInPath)
+        }
         return MenuConfig(
             deviceName: name,
             namePrefix: prefix ?? (name == nil ? nil : nil),
             service: CBUUID(string: svc),
             sessionDir: sess.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath,
-                                       isDirectory: true) }
+                                       isDirectory: true) },
+            registryPath: url(reg),
+            sessionRoot: url(root)
         )
     }
 
     var wanted: String { deviceName ?? namePrefix ?? "(未配置设备名)" }
+}
+
+/// 注册表里的一台设备 + 它当前的链路状态。
+private struct HubDevice {
+    let id: String
+    let type: String
+    let alias: String
+    var fw: Int = 0
+    var connected = false
+    var lastTelemetry = ""
+    var name: String { type.isEmpty ? id : "\(type)-\(id)" }
+    var label: String { alias.isEmpty ? id : alias }
 }
 
 final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelegate {
@@ -471,6 +496,7 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
     private var linkConnected = false
     private var linkSince: Date?
     private var lastTelemetry = ""
+    private var hubDevices: [HubDevice] = []
     private var timer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -551,8 +577,62 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
         linkConnected = connected
     }
 
+    /// 读 BleHub 的注册表,并为每台设备读一次它自己的 events.jsonl。
+    /// 全程只读 —— 菜单栏实例绝不碰业务链路,那是 worker 进程的事。
+    private func pollHub() {
+        guard let regURL = cfg.registryPath,
+              let data = try? Data(contentsOf: regURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let devs = root["devices"] as? [String: [String: Any]] else {
+            hubDevices = []
+            return
+        }
+        var out: [HubDevice] = []
+        for (id, d) in devs {
+            var hd = HubDevice(id: id,
+                               type: (d["device_type"] as? String) ?? "",
+                               alias: (d["alias"] as? String) ?? "",
+                               fw: (d["fw"] as? Int) ?? 0)
+            if let sroot = cfg.sessionRoot {
+                let ev = sroot.appendingPathComponent(id, isDirectory: true)
+                          .appendingPathComponent("events.jsonl")
+                let (conn, telem) = readLink(ev)
+                hd.connected = conn
+                hd.lastTelemetry = telem
+            }
+            out.append(hd)
+        }
+        hubDevices = out.sorted { $0.label < $1.label }
+    }
+
+    /// 只读地判断一条链路的死活 + 最近一条遥测。尾部 32KB 足够。
+    private func readLink(_ url: URL) -> (Bool, String) {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return (false, "") }
+        defer { try? h.close() }
+        let size = (try? h.seekToEnd()) ?? 0
+        try? h.seek(toOffset: size > 32768 ? size - 32768 : 0)
+        guard let d = try? h.readToEnd(), let text = String(data: d, encoding: .utf8) else {
+            return (false, "")
+        }
+        var connected = false
+        var telem = ""
+        for line in text.split(separator: "\n") {
+            if line.contains("\"event\":\"connected\"") { connected = true }
+            else if line.contains("\"event\":\"disconnected\"") { connected = false }
+            else if line.contains("\"event\":\"notification\"") {
+                if let r = line.range(of: "\"line\":\"") {
+                    telem = String(line[r.upperBound...])
+                        .replacingOccurrences(of: "\\\"", with: "\"")
+                        .replacingOccurrences(of: "\"}", with: "")
+                }
+            }
+        }
+        return (connected, telem)
+    }
+
     private func tick() {
-        pollSession()
+        pollHub()
+        if hubDevices.isEmpty { pollSession() }   // 没有注册表就退回单设备模式
         render()
     }
 
@@ -570,15 +650,24 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
         let btOK = btState == .poweredOn
         let seenRecently = lastSeen.map { Date().timeIntervalSince($0) < 20 } ?? false
 
-        // 状态栏标题:一个点表达最重要的那件事
+        // 状态栏标题:一个点表达最重要的那件事。
+        // hub 模式下带上「在线/总数」—— 抬头一眼就知道有没有掉的。
         let dot: String
         let color: NSColor
-        if !btOK { dot = "●"; color = .systemRed }
+        var suffix = ""
+        if !hubDevices.isEmpty {
+            let up = hubDevices.filter { $0.connected }.count
+            suffix = " \(up)/\(hubDevices.count)"
+            if !btOK { dot = "●"; color = .systemRed }
+            else if up == hubDevices.count { dot = "●"; color = .systemGreen }
+            else if up > 0 { dot = "●"; color = .systemYellow }
+            else { dot = "○"; color = .secondaryLabelColor }
+        } else if !btOK { dot = "●"; color = .systemRed }
         else if linkConnected { dot = "●"; color = .systemGreen }
         else if seenRecently { dot = "●"; color = .systemYellow }
         else { dot = "○"; color = .secondaryLabelColor }
         statusItem.button?.attributedTitle = NSAttributedString(
-            string: dot, attributes: [.foregroundColor: color])
+            string: dot + suffix, attributes: [.foregroundColor: color])
 
         let menu = NSMenu()
         func row(_ s: String) {
@@ -603,18 +692,31 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
         }
 
         menu.addItem(.separator())
-        if linkConnected {
+        if !hubDevices.isEmpty {
+            // BleHub 模式:注册表里每台设备一行
+            let up = hubDevices.filter { $0.connected }.count
+            row("设备:\(up)/\(hubDevices.count) 在线")
+            for d in hubDevices {
+                let mark = d.connected ? "●" : "○"
+                var line = "  \(mark) \(d.label)"
+                if d.fw > 0 { line += "  fw\(d.fw)" }
+                if !d.connected { line += "  未连接" }
+                row(line)
+                if d.connected && !d.lastTelemetry.isEmpty {
+                    row("      " + String(d.lastTelemetry.prefix(52)))
+                }
+            }
+        } else if linkConnected {
             // worker 连着时设备不再广播,这里必须说清楚,否则「未发现」会被误读成掉线
             row("链路:已连接 · \(ago(linkSince).replacingOccurrences(of: "前", with: ""))")
             row("设备:被 worker 占用(连接中不广播)")
+            if !lastTelemetry.isEmpty { row("遥测:" + String(lastTelemetry.prefix(60))) }
         } else {
             row("链路:未连接")
             row(seenRecently
                 ? "设备:\(cfg.wanted) · \(lastRSSI) dBm · \(ago(lastSeen))"
                 : "设备:未发现(已扫 \(Int(Date().timeIntervalSince(scanStartedAt))) 秒)")
-        }
-        if !lastTelemetry.isEmpty {
-            row("遥测:" + String(lastTelemetry.prefix(60)))
+            if !lastTelemetry.isEmpty { row("遥测:" + String(lastTelemetry.prefix(60))) }
         }
 
         menu.addItem(.separator())
