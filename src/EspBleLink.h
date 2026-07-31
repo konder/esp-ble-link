@@ -39,18 +39,25 @@ namespace espble {
 
 // Nordic UART Service —— 事实标准,中枢侧(含 CodeBuddy 系的 stick)都认这套。
 // 换成自定义 UUID 也行,但两侧要一起换。
-extern const char* const NUS_SERVICE;   // 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
-extern const char* const NUS_RX;        // 6E400002-…  中心→外设,WRITE | WRITE_NR
-extern const char* const NUS_TX;        // 6E400003-…  外设→中心,NOTIFY
+//
+// ⚠️ 名字刻意用 kXxx 而不是 NUS_RX 这种 ALL_CAPS。**宏不认 namespace** ——
+//    消费方只要写一句 `#define NUS_RX "…"`(对一个 NUS 项目来说是最自然的写法),
+//    下面的声明就会被展开成 `extern const char* const "6E400002-…";`,
+//    报出来的是 "expected unqualified-id before string constant",而且指向的是
+//    **它自己的** config.h,完全看不出是库占了名字。ALL_CAPS 归宏所有,库别去抢。
+//    (这不是假设 —— m5work 迁移时就是这么炸的。)
+extern const char* const kNusService;   // 6E400001-B5A3-F393-E0A9-E50E24DCCA9E
+extern const char* const kNusRx;        // 6E400002-…  中心→外设,WRITE | WRITE_NR
+extern const char* const kNusTx;        // 6E400003-…  外设→中心,NOTIFY
 
 struct LinkConfig {
     // 广播名。中枢默认按**精确名**匹配 —— 一张桌子上往往插着好几根 NUS 设备,
     // 只按 service UUID 过滤会抢到别人的(docs/pitfalls.md #7)。
     const char* deviceName = "EspBleDevice";
 
-    const char* serviceUuid = nullptr;   // nullptr → NUS_SERVICE
-    const char* rxUuid      = nullptr;   // nullptr → NUS_RX
-    const char* txUuid      = nullptr;   // nullptr → NUS_TX
+    const char* serviceUuid = nullptr;   // nullptr → kNusService
+    const char* rxUuid      = nullptr;   // nullptr → kNusRx
+    const char* txUuid      = nullptr;   // nullptr → kNusTx
 
     // 允许协商到的最大 ATT MTU。设大只是「允许」,实际值由中心决定
     // (macOS 实测常落在 185)。notify 的分片长度按协商结果动态算,不写死。

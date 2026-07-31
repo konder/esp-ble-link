@@ -132,9 +132,33 @@ Arduino ESP32 core 3.x 底下是 IDF 5.x,HCI/controller 的 deinit API 变了。
 需要彻底干净的射频状态就重启设备。本库的 `otaOverWifi()` 已经这么做了。
 
 如果你的项目非要真正的 deinit,那就得上 NimBLE-Arduino 2.x —— 但 2.x 改了回调
-签名,本库尚未适配(见 [A10](#a10))。
+签名,本库尚未适配(见 [A9](#a9))。
 
-### A10. NimBLE 2.x 编译不过
+### A10. ★ 编译报 `expected unqualified-id before string constant`,指向**你自己的** config.h
+
+```
+src/config.h:23: error: expected unqualified-id before string constant
+ #define NUS_RX  "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+```
+
+**成因**:你的头文件里有 `#define NUS_RX "…"`,而某个库的头文件里声明了同名的
+C++ 标识符。**宏不认 namespace** —— 哪怕那个声明写在 `namespace foo` 里面,
+预处理器照样替换,于是 `extern const char* const NUS_RX;` 变成了
+`extern const char* const "6E400002-…";`。
+
+最坑的是**报错位置指向你自己的 config.h**,而真正占了名字的是库,
+所以第一反应总是去怀疑自己的宏写错了。
+
+**判别**:注释掉那个 `#define`,看错误是否转移;或 `grep -rn NUS_RX` 找有没有第二处
+**声明**(不是定义)。
+
+本库因此把 UUID 常量命名为 `espble::kNusService / kNusRx / kNusTx`,而不是
+`NUS_SERVICE / NUS_RX / NUS_TX` —— ALL_CAPS 按惯例归宏所有,库不该去抢。
+所以你项目里继续写 `#define NUS_RX` 是安全的。
+
+(这条是 m5work 迁移时真炸出来的,不是纸上推演。)
+
+### A11. NimBLE 2.x 编译不过
 
 2.x 改了回调签名(`onWrite(NimBLECharacteristic*, NimBLEConnInfo&)`)。
 本库当前只支持 `h2zero/NimBLE-Arduino@^1.4.2`。

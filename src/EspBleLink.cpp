@@ -6,9 +6,9 @@
 
 namespace espble {
 
-const char* const NUS_SERVICE = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
-const char* const NUS_RX      = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
-const char* const NUS_TX      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
+const char* const kNusService = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+const char* const kNusRx      = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+const char* const kNusTx      = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
 namespace {
 
@@ -174,9 +174,9 @@ bool begin(const LinkConfig& cfg) {
     if (!s_rxSignal) s_rxSignal = xSemaphoreCreateBinary();
     if (!s_rxSignal) { free(s_ring); s_ring = nullptr; return false; }
 
-    const char* svcUuid = s_cfg.serviceUuid ? s_cfg.serviceUuid : NUS_SERVICE;
-    const char* rxUuid  = s_cfg.rxUuid      ? s_cfg.rxUuid      : NUS_RX;
-    const char* txUuid  = s_cfg.txUuid      ? s_cfg.txUuid      : NUS_TX;
+    const char* svcUuid = s_cfg.serviceUuid ? s_cfg.serviceUuid : kNusService;
+    const char* rxUuid  = s_cfg.rxUuid      ? s_cfg.rxUuid      : kNusRx;
+    const char* txUuid  = s_cfg.txUuid      ? s_cfg.txUuid      : kNusTx;
 
     NimBLEDevice::init(s_cfg.deviceName);
     NimBLEDevice::setPower(toPowerLevel(s_cfg.txPowerDbm));
