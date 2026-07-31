@@ -18,17 +18,37 @@
     channel.publish({"t": "ev", "kind": "done", "msg": "构建完成"})
 
 链路会自己保持连接、自己重连、重连后自动补推 retained 与历史。
+
+多台设备用 BleHub —— **一个 bundle(一次 TCC 授权),每台设备一个进程**:
+
+    from espble import BleHub
+
+    hub = BleHub(app_path=".build/native/MyBLEHelper.app", device_type="m5paper")
+    hub.register("c119cc", alias="客厅")
+    hub.register("7a1b02", alias="书房")
+
+    hub.send("客厅", {"t": "usage", "rev": 7})
+    hub.broadcast({"t": "cmd", "cmd": "ota"}, cap="cmd")
+
+设备身份由固件从 efuse MAC 派生,广播名是 `<type>-<id>` —— 同一份固件烧多块板子
+自动不重名。路由完全在主机侧,消息里不需要带 target 字段。
 """
 
 from .channel import RetainedChannel
 from .framing import DEFAULT_LINE_LIMIT, encode, fit_line, limit_for_ring
 from .helper_session import DeviceConfig, HelperSession
+from .hub import BleHub, DeviceLink
 from .link import BleLink
+from .registry import DeviceRecord, DeviceRegistry
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "BleHub",
     "BleLink",
+    "DeviceLink",
+    "DeviceRecord",
+    "DeviceRegistry",
     "DeviceConfig",
     "HelperSession",
     "RetainedChannel",

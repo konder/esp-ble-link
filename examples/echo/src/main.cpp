@@ -1,7 +1,7 @@
 // esp-ble-link 回环示例。
 //
 // 行为:
-//   - 广播为 ECHO_DEVICE_NAME
+//   - 广播为 <ECHO_DEVICE_TYPE>-<efuse MAC 后3字节>,如 echo-c119cc
 //   - 收到任意一行 → 原样包成 {"t":"echo","n":<序号>,"payload":"…"} notify 回去
 //   - 收到含 "\"cmd\":\"ota\"" 的行 → 切 WiFi 走 HTTP OTA
 //   - 每 30s notify 一次链路统计,便于观察丢包/溢出
@@ -15,8 +15,8 @@
 #ifndef FW_VERSION
 #define FW_VERSION 1
 #endif
-#ifndef ECHO_DEVICE_NAME
-#define ECHO_DEVICE_NAME "EspBleEcho"
+#ifndef ECHO_DEVICE_TYPE
+#define ECHO_DEVICE_TYPE "echo"
 #endif
 #ifndef OTA_HOST
 #define OTA_HOST ""
@@ -97,14 +97,18 @@ void setup() {
     delay(200);
     Serial.printf("\n[echo] esp-ble-link 回环示例 v%d\n", FW_VERSION);
 
+    // 身份不写死:广播名自动是 `<type>-<id>`,id 取自 efuse MAC 后三字节。
+    // 同一份固件烧多块板子会得到不同名字,中枢按 `echo-` 前缀发现它们。
     espble::LinkConfig cfg;
-    cfg.deviceName = ECHO_DEVICE_NAME;
+    cfg.deviceType = ECHO_DEVICE_TYPE;
+    cfg.fwVersion  = FW_VERSION;
+    cfg.caps       = "echo,cmd";       // 随 hello 帧上报,中枢据此决定广播发不发给它
     espble::onConnectionChange(onConnChange);
     if (!espble::begin(cfg)) {
         Serial.println("[echo] BLE 初始化失败(内存不够?)");
         while (true) delay(1000);
     }
-    Serial.printf("[echo] 广播中: %s\n", ECHO_DEVICE_NAME);
+    Serial.printf("[echo] 广播中: %s  (id=%s)\n", espble::deviceName(), espble::deviceId());
 }
 
 void loop() {

@@ -47,7 +47,8 @@ void loop() {
 ```bash
 pip install "git+https://github.com/konder/esp-ble-link.git#subdirectory=host"
 
-# 每台设备一个独立的 helper,bundle id 必须唯一
+# 一个**产品**一个 helper,bundle id 必须唯一。
+# 注意不是「一台设备一个」—— 多台同类设备共用一个 bundle 即可,见下面「接多台设备」。
 espble build-helper --name FooBLEHelper \
                     --bundle-id com.yourname.foo.blehelper \
                     --usage-desc "Foo 面板通过蓝牙与设备通信。"
@@ -62,8 +63,9 @@ espble watch --app .build/native/FooBLEHelper.app --device-name FooDevice
 espble send  --app .build/native/FooBLEHelper.app --device-name FooDevice '{"t":"ping"}'
 ```
 
-**第一次运行会弹蓝牙授权框,必须在 GUI 会话里点。** 从 SSH 跑不出来
-([pitfalls B1](pitfalls.md#b1))。
+**第一次运行会弹蓝牙授权框,必须在 GUI 会话里点** —— 最简单的办法是**双击这个 app**,
+它会进菜单栏模式并请求授权。授过之后 Python / launchd 从 SSH 驱动都没问题,
+GUI 只有首次授权那一次需要([pitfalls B1](pitfalls.md#b1))。
 
 ## 3. 接进你的程序
 
@@ -144,6 +146,43 @@ espble ota serve                       # 起在 :8899
 
 WiFi 凭据存在 NVS 里,首次用编译值播种。以后换 WiFi 调 `wifiSaveNvs()` 就行,
 不用重烧固件。
+
+## 接多台设备
+
+一个 bundle 就够,**不要**给每台设备建一个:
+
+```bash
+espble build-helper --name MyBLEHelper --bundle-id com.you.mydevices.blehelper
+```
+
+```python
+from espble import BleHub
+
+hub = BleHub(app_path=".build/native/MyBLEHelper.app", device_type="m5paper")
+hub.register("c119cc", alias="客厅")
+hub.register("7a1b02", alias="书房")
+
+hub.send("客厅", {"t": "usage", "rev": 7})
+hub.broadcast({"t": "cmd", "cmd": "ota"}, cap="cmd")
+```
+
+固件那边只需要给 `deviceType`,`id` 自动从 efuse MAC 派生:
+
+```cpp
+espble::LinkConfig cfg;
+cfg.deviceType = "m5paper";
+cfg.fwVersion  = FW_VERSION;
+cfg.caps       = "usage,ev,cmd";
+espble::begin(cfg);      // 广播名自动 = m5paper-<id>
+```
+
+**共用 bundle 但不共用进程**:`open -n` 会为每台设备开独立实例,各有各的
+`CBCentralManager`,而 TCC 授权只需要一次。这样既省掉 N 次授权,又保住了
+「一台设备把进程搞坏不会拖垮其它设备」——
+后者是 [pitfalls C2](pitfalls.md#c2) 那条纪律的直接要求。
+
+⚠️ 每台设备的 **session-dir 必须互斥**(`BleHub` 按 device_id 自动分)。
+`HelperSession._kill()` 是按 session-dir 匹配进程的,分错了会误杀兄弟设备的 helper。
 
 ## 排查
 

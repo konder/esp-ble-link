@@ -285,6 +285,16 @@ TCC 跟着新镜像走。
 **每个 helper 必须有独立的 bundle id。** `build_helper.sh` 会用 `mdfind` 查一遍
 撞没撞,撞了直接拒绝构建。已知占用见 [bundle-ids.md](bundle-ids.md)。
 
+> **⚠️ 这条规则的范围曾经写窄了:是「每个 helper 产品一个 bundle」,
+> 不是「每台设备一个」。**
+> 要解决的是不同产品之间撞车(CodeBuddy / claude-stick / 本框架)。
+> 同一个产品接多台设备时,**共用一个 bundle 即可** —— `open -n` 的语义是强制
+> 新实例,所以一个 bundle 能开出 N 个进程,各有各的 `CBCentralManager`,
+> 而 TCC 只需授权一次。已实测:同 bundle 两实例都拿到 `central_state:5`,互不干扰。
+>
+> 这很重要,因为「每台设备一个 bundle」意味着每加一台设备就要人去点一次授权框,
+> 多设备场景下根本不可用。做法见 [porting.md 接多台设备](porting.md)。
+
 顺带一提:同一台 Mac 上**多个 CoreBluetooth central 并发是没问题的**,
 实测三个 helper 各连各的设备同时跑得好好的。问题只出在 bundle id 撞车。
 

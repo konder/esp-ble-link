@@ -1,6 +1,7 @@
 #include "EspBleLink.h"
 
 #include <NimBLEDevice.h>
+#include <esp_mac.h>       // esp_read_mac —— 设备身份从 efuse MAC 派生
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -50,6 +51,20 @@ LinkStats s_stats;
 // 256 覆盖 notifyChunkMax 的默认值;配得更大时最后的分隔符会单独发一片,不影响正确性。
 uint8_t s_txScratch[256];
 
+// ---- 设备身份 ----
+char s_id[16]   = {0};    // 如 "c119cc"
+char s_name[48] = {0};    // 如 "m5paper-c119cc"
+volatile bool s_helloPending = false;   // onConnect 里置位,由主循环发出(回调里不干活)
+
+// efuse MAC 的后三字节。同一份固件烧多块板子会自动得到不同身份。
+// 用 esp_read_mac 而不是 ESP.getEfuseMac():后者返回的字节序是反的,拼出来的 id
+// 和你在 USB 描述符、系统蓝牙列表里看到的 MAC 对不上,排查时非常误导。
+void deriveId(char* out, size_t n) {
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(out, n, "%02x%02x%02x", mac[3], mac[4], mac[5]);
+}
+
 inline size_t ringNext(size_t i) { return (i + 1) % s_ringCap; }
 
 // 只在 NimBLE 主机任务里调用:memcpy 进环,立刻返回。不做任何解析。
@@ -87,6 +102,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         s_mtu = server->getPeerMTU(desc->conn_handle);
         s_stats.connects++;
         // ⚠️ 这里**没有** updateConnParams,将来也不要加(见 EspBleLink.h 纪律 2)。
+        // hello 帧只置标志位,真正的拼串与 notify 留给主循环 —— 回调跑在协议栈
+        // 任务里,在这儿做 String 拼接和分片发送正是纪律 1 禁止的事。
+        s_helloPending = true;
         if (s_connCb) s_connCb(true);
     }
 
@@ -178,7 +196,20 @@ bool begin(const LinkConfig& cfg) {
     const char* rxUuid  = s_cfg.rxUuid      ? s_cfg.rxUuid      : kNusRx;
     const char* txUuid  = s_cfg.txUuid      ? s_cfg.txUuid      : kNusTx;
 
-    NimBLEDevice::init(s_cfg.deviceName);
+    // 身份:显式 deviceName 优先;否则 `<type>-<id>`,id 缺省从 efuse MAC 派生
+    if (s_cfg.deviceId && *s_cfg.deviceId) {
+        snprintf(s_id, sizeof(s_id), "%s", s_cfg.deviceId);
+    } else {
+        deriveId(s_id, sizeof(s_id));
+    }
+    if (s_cfg.deviceName && *s_cfg.deviceName) {
+        snprintf(s_name, sizeof(s_name), "%s", s_cfg.deviceName);
+    } else {
+        snprintf(s_name, sizeof(s_name), "%s-%s",
+                 s_cfg.deviceType ? s_cfg.deviceType : "espble", s_id);
+    }
+
+    NimBLEDevice::init(s_name);
     NimBLEDevice::setPower(toPowerLevel(s_cfg.txPowerDbm));
     NimBLEDevice::setMTU(s_cfg.mtu);   // 只是「允许协商到这么大」,实际由中心定
 
@@ -201,6 +232,7 @@ bool begin(const LinkConfig& cfg) {
     NimBLEDevice::startAdvertising();
 
     s_started = true;
+    s_helloPending = false;
     return true;
 }
 
@@ -255,6 +287,8 @@ void resume() {
 }
 
 bool started()   { return s_started; }
+const char* deviceId()   { return s_id; }
+const char* deviceName() { return s_name; }
 bool connected() { return s_connected; }
 uint16_t peerMtu() { return s_connected ? s_mtu : 0; }
 
@@ -262,6 +296,19 @@ void onConnectionChange(ConnectionCallback cb) { s_connCb = cb; }
 
 bool popMessage(String& out) {
     if (!s_started) return false;
+
+    // 搭主循环的车把 hello 发出去。主循环一定会调 popMessage,所以不需要额外的钩子;
+    // 也保证了拼串与分片发生在主循环而非协议栈任务里。
+    if (s_helloPending && s_connected) {
+        s_helloPending = false;
+        String hello = String("{\"t\":\"hello\",\"id\":\"") + s_id +
+                       "\",\"type\":\"" + (s_cfg.deviceType ? s_cfg.deviceType : "espble") +
+                       "\",\"name\":\"" + s_name +
+                       "\",\"fw\":" + String(s_cfg.fwVersion) +
+                       ",\"mtu\":" + String(s_mtu) +
+                       ",\"caps\":\"" + (s_cfg.caps ? s_cfg.caps : "") + "\"}";
+        notify(hello);
+    }
     while (s_ringTail != s_ringHead) {
         char ch = (char)s_ring[s_ringTail];
         s_ringTail = ringNext(s_ringTail);

@@ -51,9 +51,28 @@ extern const char* const kNusRx;        // 6E400002-…  中心→外设,WRITE |
 extern const char* const kNusTx;        // 6E400003-…  外设→中心,NOTIFY
 
 struct LinkConfig {
-    // 广播名。中枢默认按**精确名**匹配 —— 一张桌子上往往插着好几根 NUS 设备,
-    // 只按 service UUID 过滤会抢到别人的(docs/pitfalls.md #7)。
-    const char* deviceName = "EspBleDevice";
+    // ---- 设备身份 ----
+    //
+    // 广播名的默认形态是 `<deviceType>-<deviceId>`,例如 `m5paper-c119cc`。
+    // 中枢按 `<type>-` 前缀发现同类设备,按全名认具体是哪一台。
+    //
+    // deviceId 留空时**自动取 efuse MAC 的后三字节**(十六进制)。这意味着
+    // 同一份固件烧十块板子会得到十个不同身份 —— 不必为了区分设备去改常量重编,
+    // 那是多设备场景里最容易出错的一步。
+    //
+    // 为什么身份塞在名字里而不是 manufacturer data:BLE 广播包只有 31 字节,
+    // 一个 128 位 service UUID 就吃掉 18 字节,再塞厂商数据基本没地方了
+    // (名字本身现在也是靠 scan response 才装得下)。塞名字零额外开销,还人眼可读。
+    const char* deviceType = "espble";
+    const char* deviceId   = nullptr;    // nullptr → 自动取 efuse MAC 后 3 字节
+
+    // 显式指定广播名。设了就完全覆盖上面的 `<type>-<id>` 拼装。
+    // ⚠️ 多设备场景下别用 —— 写死的名字意味着每台设备一份固件。
+    const char* deviceName = nullptr;
+
+    // 随 hello 帧上报给中枢,供其判断「这台设备吃哪些消息」。
+    int         fwVersion = 0;
+    const char* caps      = "";          // 逗号分隔,如 "usage,ev,cmd"
 
     const char* serviceUuid = nullptr;   // nullptr → kNusService
     const char* rxUuid      = nullptr;   // nullptr → kNusRx
@@ -140,6 +159,11 @@ void resume();
 
 // 是否已初始化(begin 成功且未 end)。
 bool started();
+
+// 本机身份。begin() 之后才有意义。
+// deviceId 若未显式配置,这里返回自动派生的那个(efuse MAC 后 3 字节)。
+const char* deviceId();
+const char* deviceName();   // 实际用于广播的名字
 
 // 当前是否有中心连着。
 bool connected();
