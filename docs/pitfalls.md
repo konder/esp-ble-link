@@ -245,6 +245,26 @@ launch → central_created → central_state:5 → scan_started → discovered�
 > 所以:**手工调试通过 ≠ 常驻部署能用**。这两种启动方式的权限路径根本不同,
 > 别拿前者的成功去推翻后者的失败。
 
+> **⚠️ 修正(实测):GUI 会话只有「首次授权」那一次需要。**
+> 早先的说法是「SSH 里 open 出来的 helper 拿不到 bluetoothd」。后来分离变量重测,
+> 发现那次结论把两件事混在了一起 —— 当时既是**直接 exec 二进制**(没有 bundle 身份,
+> TCC 无从匹配),又**还没有任何授权记录**(所以只能等一个弹不出来的弹框)。
+>
+> 实际规律是:
+> - **直接 exec bundle 内的二进制** → 没有 bundle 身份 → 怎么都不行,和会话无关
+> - **`open -g -j -n <app>` + TCC 里已有该 bundle id 的授权** → **从 SSH / launchd
+>   照样能用**,拿得到 `central_state:5`
+> - 缺的只是**第一次那个授权框**,它必须在 GUI(Aqua)会话里弹出来给人点
+>
+> 判断当前有没有授权(TCC.db 可读):
+> ```bash
+> sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
+>   "select client,auth_value from access where service='kTCCServiceBluetoothAlways'"
+> # auth_value: 2=允许 0=拒绝;查不到该 bundle id = 从没请求过
+> ```
+> **「查不到」和「0」意义完全不同**:查不到说明 app 根本没走到创建 CBCentralManager
+> 那一步(最常见的原因是启动参数不全,它在解析参数时就退出了),这时再怎么等也不会弹框。
+
 如果拿到的是 `central_state:3`(unauthorized),那才是真的 TCC 问题,
 去 系统设置 → 隐私与安全性 → 蓝牙 里允许。helper 会 emit 一条明确的 error,
 Python 侧据此标记 `fatal` 并停止重连 —— 因为重试一万次也没用。
