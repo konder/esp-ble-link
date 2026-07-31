@@ -9,7 +9,13 @@
 # 用法:
 #   build_helper.sh --name EchoBLEHelper \
 #                   --bundle-id com.example.echo.blehelper \
-#                   [--usage-desc "…"] [--out DIR] [--version 1.0]
+#                   [--usage-desc "…"] [--out DIR] [--version 1.0] \
+#                   [--device-name X] [--name-prefix Y] [--session-dir DIR] [--install]
+#
+# --device-name / --name-prefix / --session-dir 是**菜单栏模式**的默认值,写进 Info.plist。
+#   双击这个 app 会常驻菜单栏,显示蓝牙授权状态、设备在不在、以及(只读)worker 的链路状态。
+#   Python 拉起来的无界面 worker 不读它们,一切走命令行参数。
+# --install 额外拷一份到 ~/Applications,这样它在访达/启动台里可见、可双击。
 #
 # 通常不直接调,而是走 `espble build-helper`(它会把源码路径填好)。
 #
@@ -27,6 +33,10 @@ BUNDLE_ID=""
 USAGE_DESC=""
 OUT_DIR="$PWD/.build/native"
 VERSION="1.0"
+DEVICE_NAME=""
+NAME_PREFIX=""
+SESSION_DIR=""
+INSTALL=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,6 +47,10 @@ while [[ $# -gt 0 ]]; do
     --version)    VERSION="$2";    shift 2 ;;
     --src)        SRC="$2";        shift 2 ;;
     --template)   TMPL="$2";       shift 2 ;;
+    --device-name) DEVICE_NAME="$2"; shift 2 ;;
+    --name-prefix) NAME_PREFIX="$2"; shift 2 ;;
+    --session-dir) SESSION_DIR="$2"; shift 2 ;;
+    --install)    INSTALL=1;       shift ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
@@ -107,12 +121,15 @@ mkdir -p "$APP/Contents/MacOS"
 
 # 渲染 Info.plist。用 python3 做替换,免得 sed 遇到中文/斜杠/& 出幺蛾子。
 NAME="$NAME" BUNDLE_ID="$BUNDLE_ID" USAGE_DESC="$USAGE_DESC" VERSION="$VERSION" \
+DEVICE_NAME="$DEVICE_NAME" NAME_PREFIX="$NAME_PREFIX" SESSION_DIR="$SESSION_DIR" \
 python3 - "$TMPL" "$APP/Contents/Info.plist" <<'PY'
 import os, sys
 src, dst = sys.argv[1], sys.argv[2]
 text = open(src, encoding="utf-8").read()
 for key, env in (("HELPER_NAME", "NAME"), ("BUNDLE_ID", "BUNDLE_ID"),
-                 ("USAGE_DESC", "USAGE_DESC"), ("VERSION", "VERSION")):
+                 ("USAGE_DESC", "USAGE_DESC"), ("VERSION", "VERSION"),
+                 ("DEVICE_NAME", "DEVICE_NAME"), ("NAME_PREFIX", "NAME_PREFIX"),
+                 ("SESSION_DIR", "SESSION_DIR")):
     value = os.environ[env].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     text = text.replace("@@%s@@" % key, value)
 open(dst, "w", encoding="utf-8").write(text)
@@ -141,10 +158,18 @@ with open(tmp, "w", encoding="utf-8") as fh:
 os.replace(tmp, registry)
 PY
 
+if [[ $INSTALL -eq 1 ]]; then
+  mkdir -p "$HOME/Applications"
+  rm -rf "$HOME/Applications/$NAME.app"
+  cp -R "$APP" "$HOME/Applications/"
+  # TCC 认的是 bundle id + 代码签名,不是路径,所以两份副本共用同一条授权。
+  echo "installed: $HOME/Applications/$NAME.app  (访达/启动台里可见,双击进菜单栏模式)"
+fi
+
 echo "built: $APP"
 echo "bundle id: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")"
 echo
-echo "首次运行会弹蓝牙授权框(或需去 系统设置 > 隐私与安全性 > 蓝牙 手动允许)。"
-echo "⚠️ 授权框只在 GUI(Aqua)会话里弹得出来。从 SSH 会话 open 出来的 helper"
-echo "   拿不到 bluetoothd,现象是事件流停在 central_created 再无下文 —— 那不是"
-echo "   签名或 TCC 的问题,是会话上下文不对。详见 docs/pitfalls.md。"
+echo "下一步:**双击这个 app**(菜单栏模式),第一次会弹蓝牙授权框,点「允许」。"
+echo "⚠️ 授权框只在 GUI(Aqua)会话里弹得出来,SSH 里 open 是弹不出来的 ——"
+echo "   但这只影响**第一次授权**;授过之后 Python/launchd 从 SSH 驱动都没问题。"
+echo "   另注:不带参数直接跑无界面 worker 是不会弹框的,它压根不碰 CoreBluetooth。"

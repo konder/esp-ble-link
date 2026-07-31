@@ -98,6 +98,14 @@ def cmd_build_helper(args) -> int:
         cmd += ["--usage-desc", args.usage_desc]
     if args.version:
         cmd += ["--version", args.version]
+    # 菜单栏模式的默认值(写进 Info.plist);无界面 worker 不读它们
+    for flag, val in (("--device-name", args.device_name),
+                      ("--name-prefix", args.name_prefix),
+                      ("--session-dir", args.session_dir)):
+        if val:
+            cmd += [flag, val]
+    if args.install:
+        cmd += ["--install"]
     return subprocess.call(cmd)
 
 
@@ -219,6 +227,11 @@ def main(argv=None) -> int:
     p.add_argument("--usage-desc", help="蓝牙授权弹框文案")
     p.add_argument("--version", default="1.0")
     p.add_argument("--out", default=DEFAULT_APP_DIR)
+    p.add_argument("--install", action="store_true",
+                   help="额外装一份到 ~/Applications(访达/启动台可见,双击进菜单栏模式)")
+    p.add_argument("--device-name", help="菜单栏模式默认盯哪台设备(精确名)")
+    p.add_argument("--name-prefix", help="菜单栏模式默认盯哪台设备(名字前缀)")
+    p.add_argument("--session-dir", help="菜单栏模式只读地看哪个会话目录的链路状态")
     p.set_defaults(func=cmd_build_helper)
 
     p = sub.add_parser("scan", help="扫描周围的 BLE 设备(排查连不上的第一步)")

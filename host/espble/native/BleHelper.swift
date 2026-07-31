@@ -407,13 +407,267 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelega
     }
 }
 
+// ============================================================================
+// 菜单栏模式(不带 --session-dir 时)
+// ============================================================================
+//
+// 为什么要有这个模式:
+//
+// 1. **首次蓝牙授权必须有人点一下**,而弹框只在 GUI 会话里出得来。以前双击这个
+//    app 什么都不会发生 —— 参数不全,解析失败就退出,压根没碰 CoreBluetooth,
+//    系统自然不弹框。人会以为「授权坏了」,其实是根本没请求过。
+//
+// 2. 平时想知道「链路到底活着没有」,只能去翻 events.jsonl。
+//
+// ⚠️ 这个模式**不持有业务链路**。真正收发数据的仍然是 Python 拉起来的无界面
+//    worker(带 --session-dir 那条路径),它照旧「失败即自我终结、换新进程恢复」——
+//    那是绕开 CoreBluetooth 进程级坏状态的唯一手段,不能为了「常驻好看」拆掉。
+//    菜单栏这个实例只做两件事:自己扫描看设备在不在,以及**只读**地 tail worker
+//    的 events.jsonl 来显示链路状态。
+
+private struct MenuConfig {
+    let deviceName: String?
+    let namePrefix: String?
+    let service: CBUUID
+    let sessionDir: URL?
+
+    static func parse() -> MenuConfig {
+        var args = Array(CommandLine.arguments.dropFirst())
+        func take(_ flag: String) -> String? {
+            guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+            let v = args[i + 1]; args.removeSubrange(i...(i + 1))
+            return v.isEmpty ? nil : v
+        }
+        // 运行期参数优先,其次用构建期注入进 Info.plist 的默认值
+        let info = Bundle.main.infoDictionary ?? [:]
+        func plist(_ k: String) -> String? {
+            guard let s = info[k] as? String, !s.isEmpty else { return nil }
+            return s
+        }
+        let name = take("--device-name") ?? plist("ESPBLEDeviceName")
+        let prefix = take("--name-prefix") ?? plist("ESPBLENamePrefix")
+        let svc = take("--service") ?? plist("ESPBLEService") ?? defaultService
+        let sess = take("--watch-session") ?? plist("ESPBLESessionDir")
+        return MenuConfig(
+            deviceName: name,
+            namePrefix: prefix ?? (name == nil ? nil : nil),
+            service: CBUUID(string: svc),
+            sessionDir: sess.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath,
+                                       isDirectory: true) }
+        )
+    }
+
+    var wanted: String { deviceName ?? namePrefix ?? "(未配置设备名)" }
+}
+
+final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDelegate {
+    private var cfg = MenuConfig.parse()
+    private var statusItem: NSStatusItem!
+    private var central: CBCentralManager!
+    private var btState: CBManagerState = .unknown
+    private var lastSeen: Date?
+    private var lastRSSI = 0
+    private var scanStartedAt = Date()
+    private var linkConnected = false
+    private var linkSince: Date?
+    private var lastTelemetry = ""
+    private var timer: Timer?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        render()
+        // 创建 central 这一步才会触发 TCC 弹框 —— 这正是双击 app 该发生的事。
+        central = CBCentralManager(delegate: self, queue: nil)
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.tick()
+        }
+    }
+
+    // ---- CoreBluetooth ----
+
+    func centralManagerDidUpdateState(_ c: CBCentralManager) {
+        btState = c.state
+        if c.state == .poweredOn { startScan() }
+        render()
+    }
+
+    private func startScan() {
+        guard central?.state == .poweredOn else { return }
+        scanStartedAt = Date()
+        // 和 worker 一样:全扫后按名字匹配,不按 service 过滤
+        // (一张桌子上常有好几台跑 NUS 的设备)
+        central.scanForPeripherals(withServices: nil,
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+    }
+
+    func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
+                        advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        let name = (p.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let local = (advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let match: Bool
+        if let want = cfg.deviceName { match = (name == want || local == want) }
+        else if let pre = cfg.namePrefix { match = name.hasPrefix(pre) || local.hasPrefix(pre) }
+        else { match = false }
+        guard match else { return }
+        lastSeen = Date()
+        lastRSSI = RSSI.intValue
+    }
+
+    // ---- 只读地看 worker 的会话 ----
+
+    private func pollSession() {
+        guard let dir = cfg.sessionDir else { return }
+        let events = dir.appendingPathComponent("events.jsonl")
+        guard let h = try? FileHandle(forReadingFrom: events) else {
+            linkConnected = false; return
+        }
+        defer { try? h.close() }
+        // 只读尾部 64KB,文件再大也不卡
+        let size = (try? h.seekToEnd()) ?? 0
+        let start = size > 65536 ? size - 65536 : 0
+        try? h.seek(toOffset: start)
+        guard let data = try? h.readToEnd(),
+              let text = String(data: data, encoding: .utf8) else { return }
+
+        var connected = false
+        var since: Date? = linkSince
+        for line in text.split(separator: "\n") {
+            if line.contains("\"event\":\"connected\"") {
+                if !connected { since = Date() }
+                connected = true
+            } else if line.contains("\"event\":\"disconnected\"") {
+                connected = false; since = nil
+            } else if line.contains("\"event\":\"notification\"") {
+                if let r = line.range(of: "\"line\":\"") {
+                    lastTelemetry = String(line[r.upperBound...])
+                        .replacingOccurrences(of: "\\\"", with: "\"")
+                        .replacingOccurrences(of: "\"}", with: "")
+                }
+            }
+        }
+        if connected && !linkConnected { linkSince = Date() } else if !connected { linkSince = nil }
+        if connected, linkSince == nil { linkSince = since }
+        linkConnected = connected
+    }
+
+    private func tick() {
+        pollSession()
+        render()
+    }
+
+    // ---- 菜单 ----
+
+    private func ago(_ d: Date?) -> String {
+        guard let d else { return "—" }
+        let s = Int(Date().timeIntervalSince(d))
+        if s < 60 { return "\(s) 秒前" }
+        if s < 3600 { return "\(s / 60) 分钟前" }
+        return "\(s / 3600) 小时前"
+    }
+
+    private func render() {
+        let btOK = btState == .poweredOn
+        let seenRecently = lastSeen.map { Date().timeIntervalSince($0) < 20 } ?? false
+
+        // 状态栏标题:一个点表达最重要的那件事
+        let dot: String
+        let color: NSColor
+        if !btOK { dot = "●"; color = .systemRed }
+        else if linkConnected { dot = "●"; color = .systemGreen }
+        else if seenRecently { dot = "●"; color = .systemYellow }
+        else { dot = "○"; color = .secondaryLabelColor }
+        statusItem.button?.attributedTitle = NSAttributedString(
+            string: dot, attributes: [.foregroundColor: color])
+
+        let menu = NSMenu()
+        func row(_ s: String) {
+            let i = NSMenuItem(title: s, action: nil, keyEquivalent: "")
+            i.isEnabled = false
+            menu.addItem(i)
+        }
+
+        switch btState {
+        case .poweredOn:    row("蓝牙:已授权 ✓")
+        case .unauthorized: row("蓝牙:未授权 —— 见下方")
+        case .poweredOff:   row("蓝牙:已关闭")
+        case .unsupported:  row("蓝牙:不支持")
+        default:            row("蓝牙:初始化中…")
+        }
+
+        if btState == .unauthorized {
+            let i = NSMenuItem(title: "打开 系统设置 > 隐私与安全性 > 蓝牙",
+                               action: #selector(openBluetoothPrefs), keyEquivalent: "")
+            i.target = self
+            menu.addItem(i)
+        }
+
+        menu.addItem(.separator())
+        if linkConnected {
+            // worker 连着时设备不再广播,这里必须说清楚,否则「未发现」会被误读成掉线
+            row("链路:已连接 · \(ago(linkSince).replacingOccurrences(of: "前", with: ""))")
+            row("设备:被 worker 占用(连接中不广播)")
+        } else {
+            row("链路:未连接")
+            row(seenRecently
+                ? "设备:\(cfg.wanted) · \(lastRSSI) dBm · \(ago(lastSeen))"
+                : "设备:未发现(已扫 \(Int(Date().timeIntervalSince(scanStartedAt))) 秒)")
+        }
+        if !lastTelemetry.isEmpty {
+            row("遥测:" + String(lastTelemetry.prefix(60)))
+        }
+
+        menu.addItem(.separator())
+        let rescan = NSMenuItem(title: "重新扫描", action: #selector(rescan), keyEquivalent: "r")
+        rescan.target = self
+        menu.addItem(rescan)
+        if cfg.sessionDir != nil {
+            let open = NSMenuItem(title: "打开会话目录", action: #selector(openSession), keyEquivalent: "")
+            open.target = self
+            menu.addItem(open)
+        }
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出", action: #selector(quit), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+
+        statusItem.menu = menu
+    }
+
+    @objc private func rescan() {
+        central?.stopScan()
+        lastSeen = nil
+        startScan()
+        render()
+    }
+
+    @objc private func openSession() {
+        guard let d = cfg.sessionDir else { return }
+        NSWorkspace.shared.open(d)
+    }
+
+    @objc private func openBluetoothPrefs() {
+        if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth") {
+            NSWorkspace.shared.open(u)
+        }
+    }
+
+    @objc private func quit() { NSApp.terminate(nil) }
+}
+
 @main
 struct EspBleHelperMain {
     static func main() {
         let app = NSApplication.shared
-        let delegate = AppDelegate()
         app.setActivationPolicy(.accessory)     // 无 Dock 图标、不抢焦点
+
+        // 带 --session-dir = Python 拉起来的无界面 worker(原有行为,一字未改);
+        // 不带 = 用户双击打开的菜单栏模式。
+        let isWorker = CommandLine.arguments.contains("--session-dir")
+        let delegate: NSApplicationDelegate = isWorker ? AppDelegate() : MenuBarDelegate()
         app.delegate = delegate
+        // ⚠️ NSApplication.delegate 是 weak 的,局部变量会被立刻回收 —— 必须留一个强引用
+        objc_setAssociatedObject(app, "espble.delegate", delegate, .OBJC_ASSOCIATION_RETAIN)
         app.run()
     }
 }
