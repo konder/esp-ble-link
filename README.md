@@ -81,6 +81,25 @@ channel.set_retained("state", {"t": "state", "rev": 1, "battery": 82})
 channel.publish({"t": "ev", "msg": "构建完成"})
 ```
 
+不想 import(或者你的消费方根本不是 Python)—— 用 `hubd`,它把多设备中枢包成一个
+进程,stdin 收 JSON 指令、stdout 出 JSON 事件,一行一条:
+
+```bash
+# 仓库自带的 shim,不需要 pip(有些消费方跑在你挑不了的解释器上,比如 Xcode 的 python3)
+host/bin/espble hubd --app ~/.local/espble/MyHub.app \
+    --device-type m5paper --device c119cc:看板
+
+{"op":"set_retained_all","key":"usage","obj":{"t":"usage","pct":60}}
+{"op":"publish_all","obj":{"t":"ev","msg":"构建完成"}}
+{"op":"send","target":"看板","obj":{"t":"cmd","cmd":"ota"},"queue_offline":true}
+← {"event":"ready","devices":{…}}
+← {"event":"message","device":"c119cc","label":"看板","line":"{\"pct\":100}"}
+← {"event":"status","devices":{…}}          # 状态变化时主动推,消费方读缓存即可
+```
+
+状态是**推**的、不是问答式的:消费方常在自己的主循环里读"连上了吗",
+问答式会让一个卡住的 hubd 把对方主循环挂死。
+
 完整流程见 **[docs/porting.md](docs/porting.md)**。
 
 ## 文档

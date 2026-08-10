@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""仓库自带的 `espble` 入口 —— 不用装 pip 就能跑。
+
+存在的理由:消费方(比如 m5paper 看板的 collector)常常跑在一个**你不能挑的**
+解释器上。实测过的那个:macOS 自带的 `/usr/bin/python3`(Xcode 3.9),它的 pip
+老到装不了 PEP 660 editable(`pip install -e` 直接要 setup.py)。于是只剩两条路 ——
+往调用方的环境里塞 `PYTHONPATH`(补丁不进版本控制,换机器就盲踩),或者这个 shim。
+
+它只做一件事:把 `host/` 塞进 sys.path,再调 `espble.cli:main`。所以
+
+    /path/to/esp-ble-link/host/bin/espble hubd --app …
+
+在**任何** Python 3 上都能跑,而且读的是 git 工作副本 —— 和固件 lib_deps 指
+git URL 是同一个哲学:永远不会拿到一份忘了更新的快照。
+
+走 realpath 是为了让它能被 symlink 到 ~/bin 之类的地方。
+"""
+import os
+import sys
+
+_HOST = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+if _HOST not in sys.path:
+    sys.path.insert(0, _HOST)
+
+from espble.cli import main  # noqa: E402 —— 必须在 sys.path 补好之后
+
+if __name__ == "__main__":
+    sys.exit(main())

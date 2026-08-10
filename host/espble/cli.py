@@ -6,6 +6,7 @@
     espble scan   --app …                      # 只扫不连,看看周围有什么
     espble ota publish firmware.bin --version 2
     espble ota serve
+    espble hubd   --app … --device c119cc:看板  # 多设备守护进程,NDJSON 走管道
 """
 from __future__ import annotations
 
@@ -16,10 +17,12 @@ import subprocess
 import sys
 import time
 
+from . import hubd as hubd_mod
 from . import ota as ota_mod
 from .framing import fit_line
 from .helper_session import DeviceConfig, HelperSession
 from .link import BleLink
+from .registry import DEFAULT_PATH as DEFAULT_REGISTRY
 
 NATIVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native")
 DEFAULT_APP_DIR = ".build/native"
@@ -215,6 +218,12 @@ def cmd_ota_serve(args) -> int:
                          base_path=args.base_path, bind=args.bind) or 0
 
 
+# ---------- hubd ----------
+
+def cmd_hubd(args) -> int:
+    return hubd_mod.run(args)
+
+
 # ---------- main ----------
 
 def main(argv=None) -> int:
@@ -253,6 +262,22 @@ def main(argv=None) -> int:
     p.add_argument("--connect-timeout", type=float, default=40.0)
     p.add_argument("--wait", type=float, default=3.0, help="发完再等几秒收回复")
     p.set_defaults(func=cmd_send)
+
+    p = sub.add_parser("hubd", help="多设备守护进程:stdin 收 JSON 指令,stdout 出 JSON 事件")
+    p.add_argument("--app", required=True, help="helper.app 路径(所有设备共用一个 bundle)")
+    p.add_argument("--device", action="append", default=[], metavar="ID[:别名]",
+                   help="登记一台设备,可重复。id 是广播名的后缀(m5paper-c119cc → c119cc)")
+    p.add_argument("--device-type", default="", help="广播名 = <type>-<id>,要和固件的类型一致")
+    p.add_argument("--registry", default=DEFAULT_REGISTRY,
+                   help=f"设备注册表(默认 {DEFAULT_REGISTRY})")
+    p.add_argument("--session-root", default=DEFAULT_SESSION_ROOT,
+                   help="每台设备在这下面一个子目录 —— 共用会让 helper 互相误杀")
+    p.add_argument("--history-n", type=int, default=8, help="重连后以 live:false 补发几条")
+    p.add_argument("--keepalive-sec", type=float, default=30.0)
+    p.add_argument("--reconnect-sec", type=float, default=5.0)
+    p.add_argument("--backoff-max-sec", type=float, default=45.0)
+    p.add_argument("--scan-timeout", type=float, default=20.0)
+    p.set_defaults(func=cmd_hubd)
 
     p = sub.add_parser("ota", help="固件分发")
     osub = p.add_subparsers(dest="otacmd", required=True)
