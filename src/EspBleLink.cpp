@@ -55,6 +55,7 @@ uint8_t s_txScratch[256];
 char s_id[16]   = {0};    // 如 "c119cc"
 char s_name[48] = {0};    // 如 "m5paper-c119cc"
 volatile bool s_helloPending = false;   // onConnect 里置位,由主循环发出(回调里不干活)
+uint32_t s_lastVisCheck = 0;            // 可见性看门狗的节流时间戳
 
 // efuse MAC 的后三字节。同一份固件烧多块板子会自动得到不同身份。
 // 用 esp_read_mac 而不是 ESP.getEfuseMac():后者返回的字节序是反的,拼出来的 id
@@ -134,14 +135,6 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
 };
 
-// 回调对象做成静态单例而不是 new/delete。
-// deinit 失败时协议栈可能还留着指向它们的指针,那时 delete 就是 use-after-free;
-// 而反复 begin/end 又不能泄漏。静态单例把这两个问题一起消掉。
-//
-// ⚠️ 但静态单例有个必须配套的下半句:**NimBLE 的 setCallbacks 默认要拿所有权**。
-//    `setCallbacks(cb, bool deleteCallbacks = true)` —— 默认 true,于是 ~NimBLEServer
-//    会 `delete` 它。delete 一个 .bss 上的对象 = free 一个不在堆里的指针,`end()` 必 panic。
-//    所以下面注册 s_serverCallbacks 时**必须显式传 false**(见 docs/pitfalls.md A13)。
 // TX 特征的回调,只为了一件事:知道对方**什么时候真的开始听**。
 //
 // BLE 的 notify 只有在中枢写了 CCCD(订阅)之后才会真的发出去,之前发的被静默丢弃。
@@ -157,6 +150,16 @@ class TxCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+// 回调对象做成静态单例而不是 new/delete。
+// deinit 失败时协议栈可能还留着指向它们的指针,那时 delete 就是 use-after-free;
+// 而反复 begin/end 又不能泄漏。静态单例把这两个问题一起消掉。
+//
+// ⚠️ 但静态单例有个必须配套的下半句:**NimBLE 的 setCallbacks 默认要拿所有权**。
+//    `setCallbacks(cb, bool deleteCallbacks = true)` —— 默认 true,于是 ~NimBLEServer
+//    会 `delete` 它。delete 一个 .bss 上的对象 = free 一个不在堆里的指针,`end()` 必 panic。
+//    所以下面注册 s_serverCallbacks 时**必须显式传 false**(见 docs/pitfalls.md A13)。
+//    (特征的 setCallbacks 没有这个参数,而 ~NimBLECharacteristic 也不删回调,所以
+//     s_rxCallbacks / s_txCallbacks 用静态单例天然安全。)
 RxCallbacks     s_rxCallbacks;
 ServerCallbacks s_serverCallbacks;
 TxCallbacks     s_txCallbacks;
@@ -344,6 +347,14 @@ void onConnectionChange(ConnectionCallback cb) { s_connCb = cb; }
 // 精确状态,所以不会误伤"连着但很久没说话"的正常空闲连接。
 void checkVisibility() {
     if (!s_started || s_stopping || !s_server) return;
+
+    // ⚠️ 节流。popMessage() 是被应用**在 while 循环里**反复调的
+    // (`while (popMessage(m)) handle(m);`),而下面这两个调用会进 NimBLE 拿锁、
+    // 遍历 peer 表。不节流就是在主循环里对协议栈做高频轮询,反而可能拖累链路 ——
+    // 这个看门狗是"救失联"的,1 秒一次绰绰有余。
+    uint32_t now = millis();
+    if (s_lastVisCheck && (uint32_t)(now - s_lastVisCheck) < 1000) return;
+    s_lastVisCheck = now;
 
     size_t live = s_server->getConnectedCount();
 
