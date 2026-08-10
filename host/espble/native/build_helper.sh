@@ -127,8 +127,13 @@ if prev and os.path.realpath(prev) != app:
 PY
 
 if command -v mdfind >/dev/null 2>&1; then
+  # 排除两个「就是我们自己」的路径:构建输出,以及 --install 的目标。
+  # ⚠️ 少排除后者的话,**第一次 --install 之后就再也没法重建了** —— 装过去的那份
+  #    副本带着同一个 bundle id,会被这道检查当成撞车。而 --install 本来就是
+  #    rm -rf 掉它再拷一份新的,那不是撞车,那是替换自己。
   CLASH="$(mdfind "kMDItemCFBundleIdentifier == '$BUNDLE_ID'" 2>/dev/null \
-           | grep -vx "$APP" || true)"
+           | grep -vx "$APP" \
+           | grep -vx "$HOME/Applications/$NAME.app" || true)"
   if [[ -n "$CLASH" ]]; then
     echo "bundle id '$BUNDLE_ID' 已被系统里的其它 app 占用:" >&2
     echo "$CLASH" | sed 's/^/     /' >&2
