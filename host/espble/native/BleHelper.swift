@@ -502,21 +502,28 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
     private var hubDevices: [HubDevice] = []
     private var timer: Timer?
 
-    // ---- 扫描占空比 ----
+    // ---- 扫描:能不扫就不扫(见 docs/pitfalls.md C9)----
     //
-    // ⚠️ 菜单栏这份**只是个显示器**(判断「设备在不在」),真链路是 worker 进程的事。
-    //    为这点显示需求持续扫描是净亏:射频是全机共享的,持续全频段扫描会拖累同一台 Mac
-    //    上其它 helper 的链路(docs/pitfalls.md C8)—— 这个 bug 真实发生过,一个菜单栏实例
-    //    带着 AllowDuplicates 扫了 9 天,旁边还挂着两根别的 stick。
+    // ★ 这里有过两个**方向相反**的错误,两个都真实发生过,别再走回去:
     //
-    //    15s 扫 / 45s 停:设备典型的广播节奏是每 5 分钟广播 15 秒
-    //    (m5paper-monitor 的 BLE_RETRY_INTERVAL_MS / BLE_RETRY_WAIT_MS),
-    //    一个设备周期里这边有 ~5 个扫描窗口,撞上的概率足够高。
-    //    **不要改成指数退避** —— 设备要么在、要么不在,退避唯一的作用是错过它回来那一刻(C8)。
-    private static let scanWindow: TimeInterval = 15
-    private static let scanIdle: TimeInterval = 45
+    // 错误一:`AllowDuplicates: true` 且从不 stopScan。一个实例连扫 9 天,
+    //   抢射频、拖累同机其它 helper 的链路(C8)。
+    //
+    // 错误二(修错误一时引入的,更严重):改成「15s 扫 / 45s 停」的占空比。
+    //   长驻进程每分钟 start/stopScan 一次,**会把整机的 BLE 扫描投递搞坏** ——
+    //   bluetoothd 照常在收广播(system_profiler 里看得到 RSSI),但所有
+    //   CBCentralManager 客户端一个 didDiscover 都收不到。实测现象:
+    //   菜单栏一开着,collector 就永远连不上设备;把菜单栏进程杀掉,
+    //   同一条扫描命令立刻扫到 6 台。**它把自己要显示的那条链路弄断了。**
+    //
+    // 正解:**菜单栏是个只读的文件显示器,不需要扫描。** 链路状态来自 worker 写的
+    // events.jsonl 和注册表 —— 那才是权威。扫描只在「压根没有会话文件可读」的
+    // 单设备场景下当兜底,而且是**一次性、不停不启**的连续扫描。
+    //
+    // (顺带:`AllowDuplicates: false` 下每台设备每次扫描只回调一次,所以靠扫描维持
+    //  「最近看到」本来就不可靠 —— 之前那个占空比其实是在拿 churn 换 lastSeen 新鲜度。
+    //  既然链路状态有更好的来源,这笔交易压根不该做。)
     private var scanning = false
-    private var scanPhaseAt = Date()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -536,49 +543,32 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
         render()
     }
 
+    /// 需要扫描吗?只有「没有别的办法知道设备在不在」时才需要。
+    ///
+    /// - 有注册表(hub 模式)→ 不需要:每台设备的链路状态在各自的 events.jsonl 里。
+    /// - 配了 session-dir(单设备)→ 不需要:同上。
+    /// - 没有匹配条件 → 不需要:matches() 恒为 false,扫了也不可能命中
+    ///   (这正是「构建时忘了传 --name-prefix」那次的实际后果)。
+    private var needsScan: Bool {
+        guard cfg.hasTarget else { return false }
+        return cfg.registryPath == nil && cfg.sessionDir == nil
+    }
+
     private func startScan() {
-        guard central?.state == .poweredOn else { return }
-        // 没有任何匹配条件时**根本不扫**。didDiscover 那边 match 恒为 false
-        // (和 worker 的 matches() 一个道理:与其连错设备不如不连),
-        // 所以这时候扫描是纯耗电 + 纯干扰,一条都不会命中。
-        // 这正是「构建 helper 时忘了传 --name-prefix」那次的实际后果。
-        guard cfg.hasTarget else { return }
+        guard central?.state == .poweredOn, needsScan, !scanning else { return }
         scanning = true
-        scanPhaseAt = Date()
         // 和 worker 一样:全扫后按名字匹配,不按 service 过滤
-        // (一张桌子上常有好几台跑 NUS 的设备)
-        //
-        // AllowDuplicates: false —— 我们只需要知道「它在」,不需要每个广播包都回调一次。
-        // 开 true 会显著抬高射频占用和唤醒次数,而这份只是个显示器,拿不到任何好处。
+        // (一张桌子上常有好几台跑 NUS 的设备)。
+        // AllowDuplicates: false —— 只需要知道「它在」,不需要每个广播包都回调一次。
+        // **开一次就一直开着,不要周期性 stop/start**(见上面那段:churn 会搞坏全机扫描)。
         central.scanForPeripherals(withServices: nil,
                                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
     }
 
-    private func pauseScan() {
+    private func stopScanIfRunning() {
         guard scanning else { return }
         central?.stopScan()
         scanning = false
-        scanPhaseAt = Date()
-    }
-
-    /// 按占空比在「扫 15s」和「停 45s」之间翻转。挂在已有的 2s tick 上,不另开 timer。
-    private func updateScanDutyCycle() {
-        guard central?.state == .poweredOn, cfg.hasTarget else { return }
-        // worker 连着的时候设备**不广播**(NimBLE 连上就停广播,断开才由 onDisconnect 重开),
-        // 所以这时候扫描一条都不可能命中 —— 纯耗射频,还会拖累同机其它 helper(C8)。
-        // 链路状态已经从 worker 的 events.jsonl 读到了,不需要靠扫描确认它在。
-        if linkConnected || hubDevices.contains(where: { $0.connected }) {
-            pauseScan()
-            return
-        }
-        let elapsed = Date().timeIntervalSince(scanPhaseAt)
-        if scanning {
-            // 已经看到设备了就不必扫满整窗 —— 提前让出射频。
-            let seenThisWindow = lastSeen.map { $0 >= scanPhaseAt } ?? false
-            if elapsed >= Self.scanWindow || seenThisWindow { pauseScan() }
-        } else if elapsed >= Self.scanIdle {
-            startScan()
-        }
     }
 
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
@@ -686,7 +676,9 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
     }
 
     private func tick() {
-        updateScanDutyCycle()
+        // 只在"确实需要扫"且还没在扫时开一次;需求消失(比如注册表出现了)就停掉。
+        // 注意这不是占空比 —— 它由状态变化驱动,一小时最多翻转一两次,不会 churn。
+        if needsScan { startScan() } else { stopScanIfRunning() }
         pollHub()
         if hubDevices.isEmpty { pollSession() }   // 没有注册表就退回单设备模式
         render()
@@ -885,18 +877,25 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
             if !cfg.hasTarget {
                 row("设备:⚠️ 未配置匹配条件,不扫描")
                 row("      重建时带上 --name-prefix 或 --device-name")
+            } else if seenRecently {
+                row("设备:\(cfg.wanted) · \(lastRSSI) dBm · \(ago(lastSeen))")
+            } else if scanning {
+                row("设备:未发现(扫描中)")
             } else {
-                row(seenRecently
-                    ? "设备:\(cfg.wanted) · \(lastRSSI) dBm · \(ago(lastSeen))"
-                    : "设备:未发现 · \(scanning ? "扫描中" : "间歇等待")(\(Int(Self.scanWindow))s/\(Int(Self.scanIdle))s)")
+                // 有会话/注册表可读时我们**故意不扫**,所以这里不能说「未发现」——
+                // 那会读成"设备不在",而真相是"我没在找,因为有更好的来源"。
+                row("设备:—(不扫描,链路状态以会话文件为准)")
             }
             if let t = Self.formatTelemetry(lastTelemetry) { row("遥测:" + t) }
         }
 
         menu.addItem(.separator())
-        let rescan = NSMenuItem(title: "重新扫描", action: #selector(rescan), keyEquivalent: "r")
-        rescan.target = self
-        menu.addItem(rescan)
+        // 只有真的会扫的时候才给这个菜单项 —— 一个点了没反应的按钮比没有更糟。
+        if needsScan {
+            let rescan = NSMenuItem(title: "重新扫描", action: #selector(rescan), keyEquivalent: "r")
+            rescan.target = self
+            menu.addItem(rescan)
+        }
         if cfg.sessionDir != nil {
             let open = NSMenuItem(title: "打开会话目录", action: #selector(openSession), keyEquivalent: "")
             open.target = self
@@ -911,7 +910,10 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
     }
 
     @objc private func rescan() {
-        central?.stopScan()
+        // 必须走 stopScanIfRunning():它会清掉 scanning 标志,
+        // 否则下面 startScan() 的 `!scanning` 守卫会把这次重扫直接吃掉。
+        // 手点一次算状态变化驱动,不是周期 churn,可以接受。
+        stopScanIfRunning()
         lastSeen = nil
         startScan()
         render()
