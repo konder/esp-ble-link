@@ -127,6 +127,10 @@ struct LinkStats {
                                    //  返回 void,发失败我们根本不知道)
     uint32_t connects       = 0;   // 累计建连次数(排查 flapping)
     uint32_t disconnects    = 0;
+    // 下面两个是可见性看门狗的战绩。**非 0 就说明发生过"设备本来会失联"的情况** ——
+    // 对 BLE-only 的设备(没有 WiFi 兜底、失联就只能接 USB)这是最该盯的指标。
+    uint32_t staleDrops     = 0;   // 「以为连着、其实早断了」被纠正的次数(断连回调丢了)
+    uint32_t advRestarts    = 0;   // 「没连着又没广播」被重新拉起广播的次数
 };
 
 // 连接状态变化回调。⚠️ 它在 NimBLE 主机任务里被调用 —— 只能置标志位,

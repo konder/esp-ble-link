@@ -102,9 +102,13 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         s_mtu = server->getPeerMTU(desc->conn_handle);
         s_stats.connects++;
         // ⚠️ 这里**没有** updateConnParams,将来也不要加(见 EspBleLink.h 纪律 2)。
-        // hello 帧只置标志位,真正的拼串与 notify 留给主循环 —— 回调跑在协议栈
-        // 任务里,在这儿做 String 拼接和分片发送正是纪律 1 禁止的事。
-        s_helloPending = true;
+        //
+        // ⚠️ 这里**也不置 s_helloPending**。曾经置在这儿,结果 hello 被稳定丢掉:
+        //    onConnect 之后 ~20ms 主循环就把 hello notify 出去了,而中枢要走完
+        //    discoverServices → discoverCharacteristics → setNotifyValue 才订阅上 TX。
+        //    发在订阅之前 = 没有订阅者 = 被协议栈静默丢弃,而 1.4.x 的 notify() 返回 void,
+        //    设备连"这条没发出去"都不知道。现象是中枢永远拿不到 fw/caps。
+        //    正确的时机是**对方订阅上来那一刻** —— 见下面的 TxCallbacks::onSubscribe。
         if (s_connCb) s_connCb(true);
     }
 
@@ -112,6 +116,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         s_connected = false;
         s_mtu = 0;
         s_stats.disconnects++;
+        s_helloPending = false;   // 对方走了,这次的自我介绍作废
         // 丢掉半截帧,别让残字节污染下一次连接。
         s_ringHead = s_ringTail = 0;
         s_assembly = "";
@@ -137,8 +142,24 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 //    `setCallbacks(cb, bool deleteCallbacks = true)` —— 默认 true,于是 ~NimBLEServer
 //    会 `delete` 它。delete 一个 .bss 上的对象 = free 一个不在堆里的指针,`end()` 必 panic。
 //    所以下面注册 s_serverCallbacks 时**必须显式传 false**(见 docs/pitfalls.md A13)。
+// TX 特征的回调,只为了一件事:知道对方**什么时候真的开始听**。
+//
+// BLE 的 notify 只有在中枢写了 CCCD(订阅)之后才会真的发出去,之前发的被静默丢弃。
+// 所以"自我介绍"(hello)必须等到这一刻,不能在 onConnect 里发。
+class TxCallbacks : public NimBLECharacteristicCallbacks {
+    void onSubscribe(NimBLECharacteristic* chr, ble_gap_conn_desc* desc,
+                     uint16_t subValue) override {
+        (void)chr; (void)desc;
+        // subValue: bit0=notify, bit1=indicate。只关心 notify 打开的那一下。
+        if (subValue & 0x01) {
+            s_helloPending = true;   // 真正的拼串与发送留给主循环(纪律 1)
+        }
+    }
+};
+
 RxCallbacks     s_rxCallbacks;
 ServerCallbacks s_serverCallbacks;
+TxCallbacks     s_txCallbacks;
 
 // dBm → NimBLE 的功率档位枚举(硬件只有这 8 档,取最接近的)。
 esp_power_level_t toPowerLevel(int8_t dbm) {
@@ -231,6 +252,8 @@ bool begin(const LinkConfig& cfg) {
     // 别看着上面那行「对称地」给它补个 false —— 编译不过。
     rx->setCallbacks(&s_rxCallbacks);
     s_tx = svc->createCharacteristic(txUuid, NIMBLE_PROPERTY::NOTIFY);
+    // 订阅回调:hello 要等中枢真的订阅上来才发(见 TxCallbacks)。
+    s_tx->setCallbacks(&s_txCallbacks);
     svc->start();
 
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -304,11 +327,54 @@ uint16_t peerMtu() { return s_connected ? s_mtu : 0; }
 
 void onConnectionChange(ConnectionCallback cb) { s_connCb = cb; }
 
+// 可见性看门狗:确保设备**要么真连着,要么真在广播**,不会卡在"两头都不是"。
+//
+// ★ 为什么必须有这个:BLE-only 的设备一旦既没连上又没广播,就**彻底失联** ——
+//   没有 WiFi 兜底,没有远程入口,只能接 USB。而下面这两种情况都真实发生过:
+//
+//   ① 对端进程被杀 / 主机崩了,断连事件没送到设备 → s_connected 还是 true,
+//      于是不广播、也没人来,永远沉默。实测:杀掉 worker 后设备就此消失,
+//      bluetoothd 扫得到别的设备但扫不到它,最后只能用 esptool 硬复位救回来。
+//   ② 广播因为某次 rc 失败没起来(比如拆栈途中那条 rc=30,见 A8),而我们不知道。
+//
+//   老的双模固件靠"每 5 分钟回试一次 BLE"(重跑 begin())意外地兜住了这两种情况;
+//   改成 BLE-only 之后那个安全网没了,这个函数就是把它补回来。
+//
+// 判据是**问协议栈**而不是靠超时猜:getConnectedCount() 和 isAdvertising() 都是
+// 精确状态,所以不会误伤"连着但很久没说话"的正常空闲连接。
+void checkVisibility() {
+    if (!s_started || s_stopping || !s_server) return;
+
+    size_t live = s_server->getConnectedCount();
+
+    // ① 我们以为连着,协议栈说没有 → 断连回调丢了。自己收拾:清状态 + 重开广播。
+    if (s_connected && live == 0) {
+        s_connected = false;
+        s_mtu = 0;
+        s_helloPending = false;
+        s_ringHead = s_ringTail = 0;
+        s_assembly = "";
+        s_stats.staleDrops++;
+        if (s_connCb) s_connCb(false);
+    }
+
+    // ② 没连着就该在广播。否则谁都找不到我们。
+    if (!s_connected) {
+        NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+        if (adv && !adv->isAdvertising()) {
+            adv->start();
+            s_stats.advRestarts++;
+        }
+    }
+}
+
 bool popMessage(String& out) {
     if (!s_started) return false;
 
-    // 搭主循环的车把 hello 发出去。主循环一定会调 popMessage,所以不需要额外的钩子;
-    // 也保证了拼串与分片发生在主循环而非协议栈任务里。
+    // 搭主循环的车把两件事办掉:可见性看门狗 + hello。主循环一定会调 popMessage,
+    // 所以不需要额外的钩子;也保证了拼串与分片发生在主循环而非协议栈任务里。
+    checkVisibility();
+
     if (s_helloPending && s_connected) {
         s_helloPending = false;
         String hello = String("{\"t\":\"hello\",\"id\":\"") + s_id +
