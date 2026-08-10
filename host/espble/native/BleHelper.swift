@@ -564,6 +564,13 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
     /// 按占空比在「扫 15s」和「停 45s」之间翻转。挂在已有的 2s tick 上,不另开 timer。
     private func updateScanDutyCycle() {
         guard central?.state == .poweredOn, cfg.hasTarget else { return }
+        // worker 连着的时候设备**不广播**(NimBLE 连上就停广播,断开才由 onDisconnect 重开),
+        // 所以这时候扫描一条都不可能命中 —— 纯耗射频,还会拖累同机其它 helper(C8)。
+        // 链路状态已经从 worker 的 events.jsonl 读到了,不需要靠扫描确认它在。
+        if linkConnected || hubDevices.contains(where: { $0.connected }) {
+            pauseScan()
+            return
+        }
         let elapsed = Date().timeIntervalSince(scanPhaseAt)
         if scanning {
             // 已经看到设备了就不必扫满整窗 —— 提前让出射频。
@@ -760,6 +767,14 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
             row("链路:已连接 · \(ago(linkSince).replacingOccurrences(of: "前", with: ""))")
             row("设备:被 worker 占用(连接中不广播)")
             if !lastTelemetry.isEmpty { row("遥测:" + String(lastTelemetry.prefix(60))) }
+        } else if cfg.sessionDir == nil {
+            // ⚠️ 没配 session-dir → pollSession() 直接 return,我们**根本没法知道**链路状态。
+            //    这时候显示「未连接」是撒谎,而且是最坏的那种:worker 可能正连着,
+            //    而设备连接期间**不广播**,于是下面还会显示「设备未发现」——
+            //    两条错误互相印证,看起来像铁证。实际踩过:链路好着呢,菜单说没连。
+            //    看不到就说看不到。
+            row("链路:未知 —— 没配 session-dir,看不到 worker")
+            row("      重建时加 --session-dir <worker 的会话目录>")
         } else {
             row("链路:未连接")
             // ⚠️ 没配匹配条件时必须明说。以前这里显示「未发现(已扫 80 万秒)」——

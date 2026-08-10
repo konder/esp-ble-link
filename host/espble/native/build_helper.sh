@@ -82,6 +82,14 @@ if [[ -z "$DEVICE_NAME" && -z "$NAME_PREFIX" ]]; then
   echo "    (只给无界面 worker 用的话可以忽略;要能双击看状态就补上其中一个)" >&2
 fi
 
+# 同上的第二种「建出来能跑但看不到东西」:菜单栏靠 session-dir 读 worker 的链路状态。
+# 不给的话它只能显示「链路:未知」—— 而设备被 worker 连着时又不广播,
+# 于是扫描也扫不到,两条一起看极像「设备掉了」。踩过一次,这里吼一声。
+if [[ -z "$SESSION_DIR" ]]; then
+  echo "⚠️  没给 --session-dir:菜单栏看不到 worker 的链路状态(只会显示「未知」)" >&2
+  echo "    worker 的会话目录一般是 ~/.config/<你的项目>/ble-session" >&2
+fi
+
 # 可执行文件名会进 ps 输出,Python 侧靠它 + session-dir 定位进程。
 # 带空格会把 ps 解析搞乱,直接挡掉。
 if [[ "$NAME" == *" "* ]]; then
