@@ -528,11 +528,33 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         render()
-        // 创建 central 这一步才会触发 TCC 弹框 —— 这正是双击 app 该发生的事。
-        central = CBCentralManager(delegate: self, queue: nil)
+        // ★★ 只在**确实需要扫描**时才创建 CBCentralManager。见 docs/pitfalls.md C10。
+        //
+        // 这里曾经无条件创建(只为了显示"蓝牙已授权"),后果很严重:
+        // **同一个 bundle 的两个进程只要都持有 CBCentralManager,后起的那个扫描就
+        // 一个结果都拿不到。** 于是菜单栏一开着,worker 就永远扫不到设备 →
+        // 连不上 → 自杀重启 → 看起来像链路在疯狂 flapping。
+        // 而"一个 bundle、N 个进程"正是 BleHub 多设备的基础,所以这条必须守住:
+        // **不需要扫描的进程,一个 central 都不要建。**
+        //
+        // 配好之后(有注册表/会话文件)菜单栏纯读文件,不碰 CoreBluetooth;
+        // 只有全新安装(什么都没配)才建 central —— 那时既要扫描,也正好需要弹 TCC 授权框
+        // (首次授权必须在 GUI 会话里创建 central 才弹得出来,见 B1)。
+        if needsScan {
+            central = CBCentralManager(delegate: self, queue: nil)
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
+    }
+
+    /// 手动请求蓝牙授权:配好的实例平时不建 central,所以给一个显式入口。
+    /// 首次授权的 TCC 弹框只有在 GUI 会话里创建 central 时才会出现。
+    @objc private func requestBluetoothAuth() {
+        if central == nil {
+            central = CBCentralManager(delegate: self, queue: nil)
+        }
+        render()
     }
 
     // ---- CoreBluetooth ----
@@ -825,6 +847,13 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
             menu.addItem(i)
         }
 
+        if central == nil {
+            // 平时不建 central(否则会抢掉 worker 的扫描,见 C10),所以这里**不知道**
+            // 蓝牙状态 —— 又是"看不到就说看不到",不要编一个"已授权 ✓"出来。
+            // 真出了授权问题,worker 会把 `bluetooth unauthorized` 写进 events.jsonl,
+            // 下面的链路行会显示出来。
+            row("蓝牙:未查询(本进程不占用蓝牙)")
+        } else {
         switch btState {
         case .poweredOn:    row("蓝牙:已授权 ✓")
         case .unauthorized: row("蓝牙:未授权 —— 见下方")
@@ -838,6 +867,7 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
                                action: #selector(openBluetoothPrefs), keyEquivalent: "")
             i.target = self
             menu.addItem(i)
+        }
         }
 
         menu.addItem(.separator())
@@ -895,6 +925,13 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
             let rescan = NSMenuItem(title: "重新扫描", action: #selector(rescan), keyEquivalent: "r")
             rescan.target = self
             menu.addItem(rescan)
+        } else if central == nil {
+            // 平时不占蓝牙,但首次授权必须在 GUI 会话里创建一次 central 才弹得出框(B1)。
+            // ⚠️ 点了会临时占用蓝牙,可能干扰 worker 的扫描(C10)—— 标题里说明白。
+            let auth = NSMenuItem(title: "请求蓝牙授权(会临时占用蓝牙)",
+                                  action: #selector(requestBluetoothAuth), keyEquivalent: "")
+            auth.target = self
+            menu.addItem(auth)
         }
         if cfg.sessionDir != nil {
             let open = NSMenuItem(title: "打开会话目录", action: #selector(openSession), keyEquivalent: "")

@@ -277,6 +277,7 @@ esptool --port $P read_flash 0xff0000 0x10000 /tmp/core.bin   # 非空 = 又崩�
 
 ## B. 中枢侧(macOS)—— 权限与进程
 
+<a id="b1"></a>
 ### B1. ★ 事件流停在 `central_created`,再也没有下文
 
 这是**最容易误判**的一条,因为它有三个完全不同的成因,症状一模一样。
@@ -449,6 +450,38 @@ BLE 没有 MQTT 的 retained 和离线队列。用 `RetainedChannel`:
 重连时以 `live=False` 重放(设备据此只进列表、不重复蜂鸣)。
 
 **未连接时的即时消息是直接丢弃的**,这是有意的:攒着的消息重连后会一次灌爆设备。
+
+<a id="c10"></a>
+### C10. ★★★ 同 bundle 的第二个进程只要**持有** CBCentralManager,别人就扫不到东西
+
+**这条推翻了一个之前被当成结论的假设。** 「一个 bundle、N 个进程」是 BleHub 多设备的
+基础,当初的验证只看到「两个实例都拿到 `central_state: 5`」就认为互不干扰 ——
+**那个验证不充分:两边都能"开机",但扫描会互相抢。**
+
+**症状**:菜单栏实例开着的时候,
+- worker 扫描**一个 `didDiscover` 都收不到**,必然超时 → 自杀 → 重启 → 再超时……
+  从外面看像**链路在疯狂 flapping**(`c/d` 每十几秒涨一次),很容易误判成链路层的 bug;
+- 已建立的连接不受影响,`bluetoothd` 也照常在收广播;
+- **不需要那个进程在扫描** —— 它只是**创建了** `CBCentralManager` 就够了。
+  (我们把菜单栏改成"完全不扫描"之后问题照旧,才定位到是"持有"而非"使用"。)
+
+**判别方法**:把那个同 bundle 的进程杀掉,立刻重跑同一条扫描命令。
+```
+espble scan --app <bundle>   # 之前:一台都扫不到
+kill <菜单栏 pid>
+espble scan --app <bundle>   # 之后:立刻 6 台
+```
+注意**不同** bundle 的 helper 之间没有这个问题(实测两根 stick 的 helper 与 worker 共存正常)。
+
+**解**:**不需要扫描的进程,一个 central 都不要建。**
+菜单栏是只读的文件显示器,链路状态的权威来源是 worker 写的 `events.jsonl` 和注册表,
+它压根不需要 CoreBluetooth。所以改成**按需创建**:
+只有「什么都没配」(全新安装,既要扫描又正好需要弹 TCC 授权框,见 [B1](#b1))才建 central;
+配好之后一个都不建。首次授权另给一个显式菜单项。
+
+> 副作用要接受:不建 central 就**不知道**蓝牙授权状态,菜单里得老实写「未查询」,
+> 不能编一个「已授权 ✓」出来。真有授权问题 worker 会把 `bluetooth unauthorized`
+> 写进 events.jsonl。
 
 <a id="c9"></a>
 ### C9. ★★ 周期性 start/stopScan 会把**整机**的 BLE 扫描投递搞坏
