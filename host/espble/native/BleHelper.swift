@@ -461,7 +461,7 @@ private struct MenuConfig {
         }
         return MenuConfig(
             deviceName: name,
-            namePrefix: prefix ?? (name == nil ? nil : nil),
+            namePrefix: prefix,
             service: CBUUID(string: svc),
             sessionDir: sess.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath,
                                        isDirectory: true) },
@@ -471,6 +471,10 @@ private struct MenuConfig {
     }
 
     var wanted: String { deviceName ?? namePrefix ?? "(未配置设备名)" }
+
+    /// 有没有任何可用的匹配条件。没有的话 didDiscover 里 match 恒为 false,
+    /// 扫描纯属浪费射频 —— startScan() 靠这个短路掉。
+    var hasTarget: Bool { deviceName != nil || namePrefix != nil }
 }
 
 /// 注册表里的一台设备 + 它当前的链路状态。
@@ -492,12 +496,27 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
     private var btState: CBManagerState = .unknown
     private var lastSeen: Date?
     private var lastRSSI = 0
-    private var scanStartedAt = Date()
     private var linkConnected = false
     private var linkSince: Date?
     private var lastTelemetry = ""
     private var hubDevices: [HubDevice] = []
     private var timer: Timer?
+
+    // ---- 扫描占空比 ----
+    //
+    // ⚠️ 菜单栏这份**只是个显示器**(判断「设备在不在」),真链路是 worker 进程的事。
+    //    为这点显示需求持续扫描是净亏:射频是全机共享的,持续全频段扫描会拖累同一台 Mac
+    //    上其它 helper 的链路(docs/pitfalls.md C8)—— 这个 bug 真实发生过,一个菜单栏实例
+    //    带着 AllowDuplicates 扫了 9 天,旁边还挂着两根别的 stick。
+    //
+    //    15s 扫 / 45s 停:设备典型的广播节奏是每 5 分钟广播 15 秒
+    //    (m5paper-monitor 的 BLE_RETRY_INTERVAL_MS / BLE_RETRY_WAIT_MS),
+    //    一个设备周期里这边有 ~5 个扫描窗口,撞上的概率足够高。
+    //    **不要改成指数退避** —— 设备要么在、要么不在,退避唯一的作用是错过它回来那一刻(C8)。
+    private static let scanWindow: TimeInterval = 15
+    private static let scanIdle: TimeInterval = 45
+    private var scanning = false
+    private var scanPhaseAt = Date()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -519,11 +538,40 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
 
     private func startScan() {
         guard central?.state == .poweredOn else { return }
-        scanStartedAt = Date()
+        // 没有任何匹配条件时**根本不扫**。didDiscover 那边 match 恒为 false
+        // (和 worker 的 matches() 一个道理:与其连错设备不如不连),
+        // 所以这时候扫描是纯耗电 + 纯干扰,一条都不会命中。
+        // 这正是「构建 helper 时忘了传 --name-prefix」那次的实际后果。
+        guard cfg.hasTarget else { return }
+        scanning = true
+        scanPhaseAt = Date()
         // 和 worker 一样:全扫后按名字匹配,不按 service 过滤
         // (一张桌子上常有好几台跑 NUS 的设备)
+        //
+        // AllowDuplicates: false —— 我们只需要知道「它在」,不需要每个广播包都回调一次。
+        // 开 true 会显著抬高射频占用和唤醒次数,而这份只是个显示器,拿不到任何好处。
         central.scanForPeripherals(withServices: nil,
-                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+                                   options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+    }
+
+    private func pauseScan() {
+        guard scanning else { return }
+        central?.stopScan()
+        scanning = false
+        scanPhaseAt = Date()
+    }
+
+    /// 按占空比在「扫 15s」和「停 45s」之间翻转。挂在已有的 2s tick 上,不另开 timer。
+    private func updateScanDutyCycle() {
+        guard central?.state == .poweredOn, cfg.hasTarget else { return }
+        let elapsed = Date().timeIntervalSince(scanPhaseAt)
+        if scanning {
+            // 已经看到设备了就不必扫满整窗 —— 提前让出射频。
+            let seenThisWindow = lastSeen.map { $0 >= scanPhaseAt } ?? false
+            if elapsed >= Self.scanWindow || seenThisWindow { pauseScan() }
+        } else if elapsed >= Self.scanIdle {
+            startScan()
+        }
     }
 
     func centralManager(_ c: CBCentralManager, didDiscover p: CBPeripheral,
@@ -631,6 +679,7 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
     }
 
     private func tick() {
+        updateScanDutyCycle()
         pollHub()
         if hubDevices.isEmpty { pollSession() }   // 没有注册表就退回单设备模式
         render()
@@ -713,9 +762,17 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
             if !lastTelemetry.isEmpty { row("遥测:" + String(lastTelemetry.prefix(60))) }
         } else {
             row("链路:未连接")
-            row(seenRecently
-                ? "设备:\(cfg.wanted) · \(lastRSSI) dBm · \(ago(lastSeen))"
-                : "设备:未发现(已扫 \(Int(Date().timeIntervalSince(scanStartedAt))) 秒)")
+            // ⚠️ 没配匹配条件时必须明说。以前这里显示「未发现(已扫 80 万秒)」——
+            //    读起来像「设备不在」,实际是构建 helper 时漏了 --name-prefix,
+            //    它压根没在找任何东西。这条误导过一次,别再让它沉默。
+            if !cfg.hasTarget {
+                row("设备:⚠️ 未配置匹配条件,不扫描")
+                row("      重建时带上 --name-prefix 或 --device-name")
+            } else {
+                row(seenRecently
+                    ? "设备:\(cfg.wanted) · \(lastRSSI) dBm · \(ago(lastSeen))"
+                    : "设备:未发现 · \(scanning ? "扫描中" : "间歇等待")(\(Int(Self.scanWindow))s/\(Int(Self.scanIdle))s)")
+            }
             if !lastTelemetry.isEmpty { row("遥测:" + String(lastTelemetry.prefix(60))) }
         }
 

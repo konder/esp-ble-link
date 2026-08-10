@@ -113,6 +113,7 @@ assert failed: multi_heap_free
 本库用一个 `s_stopping` 标志,`quiesce()`/`end()` 进入前置位。
 **自己写外设固件的话这条一定要有** —— 只要你有任何「主动关掉 BLE」的路径就会撞上。
 
+<a id="a9"></a>
 ### A9. ★ NimBLE-Arduino 1.4.x 的 `deinit()` 在 Arduino core 3.x 上必 panic
 
 ```
@@ -124,6 +125,12 @@ assert failed: heap_caps_free heap_caps_base.c:75
 `259` = `ESP_ERR_INVALID_STATE`。**成因**:NimBLE-Arduino 1.4.x 是照 ESP-IDF 4.x 写的,
 Arduino ESP32 core 3.x 底下是 IDF 5.x,HCI/controller 的 deinit API 变了。
 
+> ⚠️ **先看第一行有没有 `259`。** 第二行那个 `free() target pointer is outside heap areas`
+> **还有另一个完全不同的成因**,和 core 版本一点关系都没有,在 core 2.0.17 上也炸 ——
+> 见 [A13](#a13)。如果你只看到断言、没有 `259`,那就是 A13,别在这条上浪费时间。
+> (这两条症状雷同,实际害过一整晚:因为 A9 写着「core 3.x」,而设备跑的是 2.0.17,
+> 于是「不可能是这条」的判断反复把排查方向带偏。)
+
 **要命的地方是它只坏这一条路**:广播、连接、收发、重连全都正常,单元测试和日常
 使用一点问题都没有 —— 只有「主动关掉 BLE」时才炸。所以很容易到了要做 OTA
 那天才发现。
@@ -132,7 +139,7 @@ Arduino ESP32 core 3.x 底下是 IDF 5.x,HCI/controller 的 deinit API 变了。
 需要彻底干净的射频状态就重启设备。本库的 `otaOverWifi()` 已经这么做了。
 
 如果你的项目非要真正的 deinit,那就得上 NimBLE-Arduino 2.x —— 但 2.x 改了回调
-签名,本库尚未适配(见 [A9](#a9))。
+签名,本库尚未适配(见 [A12](#a12))。
 
 ### A10. ★ 编译报 `expected unqualified-id before string constant`,指向**你自己的** config.h
 
@@ -201,10 +208,70 @@ hard_reset/soft_reset/no_reset/no_reset_stub)。PlatformIO 捆绑的往往就是
 顺带一提:**在这块板上「打开串口」这个动作本身就会触发上述复位**,所以
 「读串口看看它在干嘛」会把它敲回下载模式。判活优先用 BLE 或上面那个 no_reset 探针。
 
+<a id="a12"></a>
 ### A12. NimBLE 2.x 编译不过
 
 2.x 改了回调签名(`onWrite(NimBLECharacteristic*, NimBLEConnInfo&)`)。
 本库当前只支持 `h2zero/NimBLE-Arduino@^1.4.2`。
+
+<a id="a13"></a>
+### A13. ★★ `end()` 必 panic —— 静态回调对象被 NimBLE 拿去 delete 了(≤0.1.0)
+
+**这是本仓库自己犯过的最贵的 bug**:设备开机 30 秒后无限重启,而且**症状伪装成 [A9](#a9)**。
+
+```
+assert failed: heap_caps_free heap_caps.c:381
+               (heap != NULL && "free() target pointer is outside heap areas")
+```
+
+**判别方法(和 A9 分开的关键)**——两条症状文本几乎一样,但:
+
+| | A9 | A13(这条) |
+|---|---|---|
+| 第一行有 `...deinit() failed with error: 259` | **有** | **没有** |
+| Arduino core 版本 | 只在 3.x | **任何版本**(2.0.17 实测会炸) |
+| backtrace 里 | 停在 HCI deinit | 有 **`~ServerCallbacks`** 和 `operator delete` 帧 |
+
+**成因**:NimBLE-Arduino 1.4.x 的
+
+```cpp
+void setCallbacks(NimBLEServerCallbacks* pCallbacks, bool deleteCallbacks = true);
+```
+
+**默认拿所有权**,`~NimBLEServer()` 里照办:
+
+```cpp
+if (m_deleteCallbacks && m_pServerCallbacks != &defaultCallbacks) { delete m_pServerCallbacks; }
+```
+
+而本库(和大多数人)的回调对象是**静态单例**(理由见 `EspBleLink.cpp` 里那段注释:
+避免 deinit 失败后协议栈还留着指针时 delete → use-after-free)。于是
+`end()` → `deinit(true)` → `~NimBLEServer` → `delete` 一个 **.bss 地址** → `free()` 断言。
+
+**解**:注册时显式交出「别删」——
+
+```cpp
+s_server->setCallbacks(&s_serverCallbacks, false);   // ← 第二个参数
+```
+
+0.1.1 已修。**注意不对称**:`NimBLECharacteristic::setCallbacks()` 只有一个形参,
+而 `~NimBLECharacteristic` 本来就不删回调,所以特征值那边不需要(也不能加)这个参数。
+
+**为什么值得单独记一条**:
+- 它**只在拆栈路径上炸**。广播、连接、收发、重连全部正常 —— 和 A9 一样,平时测不出来。
+- 症状是**重启**,不是报错。如果设备的兜底逻辑里有「BLE 超时 → 关 BLE 换 WiFi」,
+  就会变成**开机 → 等 30 秒 → panic → 重启**的无限循环,而屏幕停在「等待连接」那一帧,
+  看起来像卡住/连不上,完全不像崩溃。
+- coredump 是唯一的直达证据。**但解 coredump 必须用与设备上那版完全一致的 ELF**,
+  否则 `esp-coredump` 会拒绝(`coredump SHA256 != app SHA256`)。手上没有对应 ELF 时,
+  最快的路是:擦掉 dump 区 → 烧一版你有 ELF 的固件 → 让它自己再崩一次。
+
+```bash
+# 判断「这一版还崩不崩」的可靠判据:dump 区是空的就是没崩
+esptool --port $P erase_region 0xff0000 0x10000     # 先擦
+# …烧录、等它跑一个完整周期…
+esptool --port $P read_flash 0xff0000 0x10000 /tmp/core.bin   # 非空 = 又崩了
+```
 
 ---
 

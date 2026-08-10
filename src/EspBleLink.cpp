@@ -132,6 +132,11 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 // 回调对象做成静态单例而不是 new/delete。
 // deinit 失败时协议栈可能还留着指向它们的指针,那时 delete 就是 use-after-free;
 // 而反复 begin/end 又不能泄漏。静态单例把这两个问题一起消掉。
+//
+// ⚠️ 但静态单例有个必须配套的下半句:**NimBLE 的 setCallbacks 默认要拿所有权**。
+//    `setCallbacks(cb, bool deleteCallbacks = true)` —— 默认 true,于是 ~NimBLEServer
+//    会 `delete` 它。delete 一个 .bss 上的对象 = free 一个不在堆里的指针,`end()` 必 panic。
+//    所以下面注册 s_serverCallbacks 时**必须显式传 false**(见 docs/pitfalls.md A13)。
 RxCallbacks     s_rxCallbacks;
 ServerCallbacks s_serverCallbacks;
 
@@ -214,11 +219,16 @@ bool begin(const LinkConfig& cfg) {
     NimBLEDevice::setMTU(s_cfg.mtu);   // 只是「允许协商到这么大」,实际由中心定
 
     s_server = NimBLEDevice::createServer();
-    s_server->setCallbacks(&s_serverCallbacks);
+    // 第二个参数 false = 所有权留在我们这儿,别让 ~NimBLEServer 去 delete 一个静态对象。
+    // 漏掉它 → end() 必 panic(pitfalls A13)。改这行前先把 A13 读完。
+    s_server->setCallbacks(&s_serverCallbacks, false);
 
     NimBLEService* svc = s_server->createService(svcUuid);
     NimBLECharacteristic* rx = svc->createCharacteristic(
         rxUuid, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    // 这里**没有**也**不能加**第二个参数:NimBLECharacteristic::setCallbacks 只有一个形参,
+    // 而 ~NimBLECharacteristic 本来就不删回调(只删 descriptor),静态单例天然安全。
+    // 别看着上面那行「对称地」给它补个 false —— 编译不过。
     rx->setCallbacks(&s_rxCallbacks);
     s_tx = svc->createCharacteristic(txUuid, NIMBLE_PROPERTY::NOTIFY);
     svc->start();

@@ -40,12 +40,23 @@
   <string>NSApplication</string>
 
   <!-- 菜单栏模式(双击打开、不带 --session-dir)用的默认值。
-       无界面 worker 模式不读这些,它的一切都来自命令行参数。 -->
+       无界面 worker 模式不读这些,它的一切都来自命令行参数。
+
+       ⚠️ DEVICE_NAME 和 NAME_PREFIX 至少要给一个。两个都空 → 菜单栏实例不可能匹配到
+       任何设备,它会直接不扫描,并在菜单里显示「未配置匹配条件」。
+       (曾经因为构建时漏了 --name-prefix,一个实例空扫了 9 天。) -->
   <key>ESPBLEDeviceName</key>
   <string>@@DEVICE_NAME@@</string>
   <key>ESPBLENamePrefix</key>
   <string>@@NAME_PREFIX@@</string>
   <key>ESPBLESessionDir</key>
   <string>@@SESSION_DIR@@</string>
+
+  <!-- BleHub(多设备)模式:注册表 + 每台设备的会话根目录。
+       留空则用代码里的默认值 ~/.config/espble/{devices.json,sessions}。 -->
+  <key>ESPBLERegistry</key>
+  <string>@@DEV_REGISTRY@@</string>
+  <key>ESPBLESessionRoot</key>
+  <string>@@SESSION_ROOT@@</string>
 </dict>
 </plist>

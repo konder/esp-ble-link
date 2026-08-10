@@ -145,6 +145,10 @@ bool begin(const LinkConfig& cfg = LinkConfig());
 //    正常收发完全不受影响 —— **只有拆栈这条路是坏的**。
 //    要临时让出射频请用 quiesce();要彻底释放请重启设备。
 //    详见 docs/pitfalls.md A9。
+//
+// ⚠️ 0.1.1 之前的版本在**所有** core 版本上都会 panic —— 那是另一个成因(回调对象
+//    所有权,见 pitfalls A13),已修。如果你是从 0.1.0 升上来的,`end()` 现在是可用的:
+//    m5paper-monitor 就靠它在 BLE 超时后让出 2.4G 给 WiFi。
 void end();
 
 // 让 BLE 安静下来:停广播 + 断开对端,但**保留协议栈**。

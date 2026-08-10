@@ -1,6 +1,6 @@
 {
   "name": "EspBleLink",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "ESP32 BLE peripheral link layer (Nordic UART Service) with newline-delimited framing, plus WiFi-mode OTA. Designed to pair with the espble macOS central helper.",
   "keywords": ["ble", "nimble", "nus", "esp32", "ota"],
   "license": "MIT",

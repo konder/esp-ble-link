@@ -10,11 +10,19 @@
 #   build_helper.sh --name EchoBLEHelper \
 #                   --bundle-id com.example.echo.blehelper \
 #                   [--usage-desc "…"] [--out DIR] [--version 1.0] \
-#                   [--device-name X] [--name-prefix Y] [--session-dir DIR] [--install]
+#                   [--device-name X] [--name-prefix Y] [--session-dir DIR] \
+#                   [--registry FILE] [--session-root DIR] [--install]
 #
 # --device-name / --name-prefix / --session-dir 是**菜单栏模式**的默认值,写进 Info.plist。
 #   双击这个 app 会常驻菜单栏,显示蓝牙授权状态、设备在不在、以及(只读)worker 的链路状态。
 #   Python 拉起来的无界面 worker 不读它们,一切走命令行参数。
+#
+# ⚠️ --device-name 和 --name-prefix **至少给一个**,否则菜单栏实例找不到任何设备
+#   (它会直接不扫描并在菜单里报错)。这条脚本会警告,但不阻止 —— 只给 Python worker
+#   用的 bundle 确实不需要它们。踩过的坑:漏了 --name-prefix,菜单里一直显示
+#   「未发现」,而真正的原因是它压根没在找。
+#
+# --registry / --session-root 是 BleHub 多设备模式的路径,留空用代码默认值。
 # --install 额外拷一份到 ~/Applications,这样它在访达/启动台里可见、可双击。
 #
 # 通常不直接调,而是走 `espble build-helper`(它会把源码路径填好)。
@@ -36,6 +44,8 @@ VERSION="1.0"
 DEVICE_NAME=""
 NAME_PREFIX=""
 SESSION_DIR=""
+REGISTRY_PATH=""
+SESSION_ROOT=""
 INSTALL=0
 
 while [[ $# -gt 0 ]]; do
@@ -50,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --device-name) DEVICE_NAME="$2"; shift 2 ;;
     --name-prefix) NAME_PREFIX="$2"; shift 2 ;;
     --session-dir) SESSION_DIR="$2"; shift 2 ;;
+    --registry)    REGISTRY_PATH="$2"; shift 2 ;;
+    --session-root) SESSION_ROOT="$2"; shift 2 ;;
     --install)    INSTALL=1;       shift ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
@@ -60,6 +72,15 @@ done
 [[ -f "$SRC" ]]       || { echo "找不到源码: $SRC" >&2; exit 2; }
 [[ -f "$TMPL" ]]      || { echo "找不到模板: $TMPL" >&2; exit 2; }
 [[ -z "$USAGE_DESC" ]] && USAGE_DESC="$NAME 通过蓝牙低功耗与 ESP 设备通信。"
+
+# 两个匹配条件都没给 → 菜单栏实例不可能匹配到任何设备。
+# 不当错误处理:只给 Python worker 用的 bundle 本来就不需要这些(worker 走命令行参数)。
+# 但必须吼一声 —— 曾经因为漏了 --name-prefix,菜单里一直显示「未发现」,
+# 而真实原因是它压根没在找,白扫了 9 天。
+if [[ -z "$DEVICE_NAME" && -z "$NAME_PREFIX" ]]; then
+  echo "⚠️  没给 --device-name / --name-prefix:双击这个 app 时它不会扫描任何设备" >&2
+  echo "    (只给无界面 worker 用的话可以忽略;要能双击看状态就补上其中一个)" >&2
+fi
 
 # 可执行文件名会进 ps 输出,Python 侧靠它 + session-dir 定位进程。
 # 带空格会把 ps 解析搞乱,直接挡掉。
@@ -122,6 +143,7 @@ mkdir -p "$APP/Contents/MacOS"
 # 渲染 Info.plist。用 python3 做替换,免得 sed 遇到中文/斜杠/& 出幺蛾子。
 NAME="$NAME" BUNDLE_ID="$BUNDLE_ID" USAGE_DESC="$USAGE_DESC" VERSION="$VERSION" \
 DEVICE_NAME="$DEVICE_NAME" NAME_PREFIX="$NAME_PREFIX" SESSION_DIR="$SESSION_DIR" \
+DEV_REGISTRY="$REGISTRY_PATH" SESSION_ROOT="$SESSION_ROOT" \
 python3 - "$TMPL" "$APP/Contents/Info.plist" <<'PY'
 import os, sys
 src, dst = sys.argv[1], sys.argv[2]
@@ -129,7 +151,10 @@ text = open(src, encoding="utf-8").read()
 for key, env in (("HELPER_NAME", "NAME"), ("BUNDLE_ID", "BUNDLE_ID"),
                  ("USAGE_DESC", "USAGE_DESC"), ("VERSION", "VERSION"),
                  ("DEVICE_NAME", "DEVICE_NAME"), ("NAME_PREFIX", "NAME_PREFIX"),
-                 ("SESSION_DIR", "SESSION_DIR")):
+                 ("SESSION_DIR", "SESSION_DIR"),
+                 # ⚠️ DEV_REGISTRY = 设备注册表(devices.json),**不是**上面那个
+                 # 查 bundle id 撞车用的 helpers.json($REGISTRY)。两者别搞混。
+                 ("DEV_REGISTRY", "DEV_REGISTRY"), ("SESSION_ROOT", "SESSION_ROOT")):
     value = os.environ[env].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     text = text.replace("@@%s@@" % key, value)
 open(dst, "w", encoding="utf-8").write(text)
