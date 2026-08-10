@@ -694,6 +694,63 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
 
     // ---- 菜单 ----
 
+    /// 把设备上报的遥测 JSON 排成紧凑的 `k=v` 一行。
+    ///
+    /// ⚠️ **刻意不解读语义。** `pct` / `up` / `v` 这些是**应用**自己定的字段
+    /// (m5paper-monitor 用它们表示电量/运行秒数/固件版本),框架不该认识它们 ——
+    /// 这个仓库一直守着「应用不持有协议细节、框架不持有业务字段」这条线,
+    /// 一旦在这里 `if key == "pct" { 显示成百分比 }`,框架就绑死到一个应用上了。
+    ///
+    /// 代价是拿不到"100% · 已运行 17 分钟"那种人性化排版。要那个得让应用侧传格式提示,
+    /// 那是另一件事。当前这样已经比原来 `prefix(52)` 硬截断原始字符串好得多
+    /// (截断会把 JSON 切在半个转义序列上,读起来是乱码)。
+    static func formatTelemetry(_ raw: String, budget: Int = 56) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let data = trimmed.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              !obj.isEmpty else {
+            // 不是 JSON(或是空对象)就退回原样,按**字符**截断以免切坏 UTF-8。
+            // 空对象没什么可显示的,直接不显示。
+            if trimmed == "{}" || trimmed == "[]" { return nil }
+            return String(trimmed.prefix(budget))
+        }
+
+        // ⚠️ 按**原始 JSON 里的字段顺序**取,不要按字母序。
+        //    字母序 + 截断会把最有用的字段切掉 —— 实测 m5paper 的遥测按字母序只剩
+        //    `c chg d g5 ls`,而 pct / up / v 全被挤掉了。应用把重要字段写在前面,尊重它。
+        //    (Swift 字典是无序的,所以顺序得从原文里捞;直接遍历字典还会每次刷新都跳。)
+        var order: [String] = []
+        var picked = Set<String>()
+        let ns = trimmed as NSString
+        if let re = try? NSRegularExpression(pattern: "\"([^\"]+)\"\\s*:") {
+            re.enumerateMatches(in: trimmed, range: NSRange(location: 0, length: ns.length)) { m, _, _ in
+                guard let m, m.numberOfRanges > 1 else { return }
+                let k = ns.substring(with: m.range(at: 1))
+                if obj[k] != nil, picked.insert(k).inserted { order.append(k) }
+            }
+        }
+        if order.isEmpty { order = obj.keys.sorted() }      // 正则没捞到时的兜底
+
+        var parts: [String] = []
+        var used = 0
+        for k in order {
+            // **只渲染标量。** 嵌套对象/数组会被 Swift 的 description 排成多行,
+            // 直接把菜单行搞烂(实测 `a={\n b = 1;\n}`)。
+            let piece: String
+            switch obj[k] {
+            case let n as NSNumber: piece = "\(k)=\(n)"
+            case let s as String:   piece = "\(k)=\(s.prefix(12))"
+            default: continue
+            }
+            // 按总长度收口而不是按字段个数 —— 一行能塞多少就塞多少,信息量最大化
+            if used + piece.count + 1 > budget { break }
+            parts.append(piece)
+            used += piece.count + 1
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " ")
+    }
+
     private func ago(_ d: Date?) -> String {
         guard let d else { return "—" }
         let s = Int(Date().timeIntervalSince(d))
@@ -702,28 +759,72 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
         return "\(s / 3600) 小时前"
     }
 
+    /// 菜单栏本体:一个天线图标 + 每台设备一个点(实心=在线,空心=掉线)。
+    ///
+    /// 三条设计约束,改之前先读:
+    /// 1. **图标用 template image。** 菜单栏深浅色会自动反相,写死颜色在浅色栏里看不清。
+    ///    状态主要靠**图标形状**(有没有斜杠)和**点的实心/空心**表达,不是靠颜色 ——
+    ///    这样色盲也能用,深浅色切换也不会糊。红色只留给"蓝牙压根不能用"。
+    /// 2. **`NSImage(systemSymbolName:)` 是 optional**,符号名打错会静默变成
+    ///    **空白菜单栏项**(点不到、看不见,极难查)。所以必须 nil 回退到文字字形。
+    /// 3. 设备多了点会挤 —— 超过 dotLimit 台就退化成 `3/5` 数字。
+    private static let dotLimit = 4
+
+    private func renderStatusItem(btOK: Bool, seenRecently: Bool) {
+        guard let button = statusItem.button else { return }
+
+        // ---- 图标 ----
+        // 蓝牙不可用时用带斜杠的变体:一眼看出"不是设备的问题,是本机蓝牙的问题"。
+        let symbol = btOK ? "antenna.radiowaves.left.and.right"
+                          : "antenna.radiowaves.left.and.right.slash"
+        if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "ESP BLE") {
+            img.isTemplate = true          // 跟随菜单栏深浅色
+            button.image = img
+            button.imagePosition = .imageLeading
+        } else {
+            // 回退:符号不存在(改错名字/更老的系统)也得让人看见东西
+            button.image = nil
+        }
+        let fellBack = button.image == nil
+
+        // ---- 点 / 计数 ----
+        var text = ""
+        var color: NSColor = .labelColor
+        if !btOK {
+            text = fellBack ? " 蓝牙✕" : ""
+            color = .systemRed
+        } else if !hubDevices.isEmpty {
+            let up = hubDevices.filter { $0.connected }.count
+            if hubDevices.count > Self.dotLimit {
+                text = " \(up)/\(hubDevices.count)"      // 太多了,退化成数字
+            } else {
+                // 顺序跟下拉菜单里一致(都按 label 排),否则对不上号
+                text = " " + hubDevices.map { $0.connected ? "●" : "○" }.joined()
+            }
+            color = up == 0 ? .secondaryLabelColor : .labelColor
+        } else {
+            // 单设备模式(没有注册表)。sessionDir 都没配时我们其实不知道链路状态,
+            // 别画一个看起来很确定的空心点 —— 用问号表达"不知道"。
+            if cfg.sessionDir == nil && !cfg.hasTarget {
+                text = " ?"
+                color = .secondaryLabelColor
+            } else {
+                text = linkConnected || seenRecently ? " ●" : " ○"
+                color = linkConnected ? .labelColor : .secondaryLabelColor
+            }
+        }
+        if fellBack && btOK && text.isEmpty { text = " BLE" }
+        button.attributedTitle = NSAttributedString(
+            string: text,
+            attributes: [.foregroundColor: color,
+                         .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)])
+    }
+
     private func render() {
         let btOK = btState == .poweredOn
         let seenRecently = lastSeen.map { Date().timeIntervalSince($0) < 20 } ?? false
 
-        // 状态栏标题:一个点表达最重要的那件事。
-        // hub 模式下带上「在线/总数」—— 抬头一眼就知道有没有掉的。
-        let dot: String
-        let color: NSColor
-        var suffix = ""
-        if !hubDevices.isEmpty {
-            let up = hubDevices.filter { $0.connected }.count
-            suffix = " \(up)/\(hubDevices.count)"
-            if !btOK { dot = "●"; color = .systemRed }
-            else if up == hubDevices.count { dot = "●"; color = .systemGreen }
-            else if up > 0 { dot = "●"; color = .systemYellow }
-            else { dot = "○"; color = .secondaryLabelColor }
-        } else if !btOK { dot = "●"; color = .systemRed }
-        else if linkConnected { dot = "●"; color = .systemGreen }
-        else if seenRecently { dot = "●"; color = .systemYellow }
-        else { dot = "○"; color = .secondaryLabelColor }
-        statusItem.button?.attributedTitle = NSAttributedString(
-            string: dot + suffix, attributes: [.foregroundColor: color])
+        renderStatusItem(btOK: btOK, seenRecently: seenRecently)
 
         let menu = NSMenu()
         func row(_ s: String) {
@@ -753,20 +854,21 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
             let up = hubDevices.filter { $0.connected }.count
             row("设备:\(up)/\(hubDevices.count) 在线")
             for d in hubDevices {
-                let mark = d.connected ? "●" : "○"
-                var line = "  \(mark) \(d.label)"
-                if d.fw > 0 { line += "  fw\(d.fw)" }
-                if !d.connected { line += "  未连接" }
+                var line = "  \(d.connected ? "●" : "○")  \(d.label)"
+                if d.fw > 0 { line += "   fw\(d.fw)" }
+                if !d.connected { line += "   未连接" }
                 row(line)
-                if d.connected && !d.lastTelemetry.isEmpty {
-                    row("      " + String(d.lastTelemetry.prefix(52)))
+                // ⚠️ 这里**故意不显示 RSSI**。设备连上之后就不再广播了,菜单栏扫不到它,
+                //    手上没有任何实时信号强度。显示一个连接时的旧值等于拿陈旧数据冒充实时。
+                if d.connected, let t = Self.formatTelemetry(d.lastTelemetry) {
+                    row("        " + t)
                 }
             }
         } else if linkConnected {
             // worker 连着时设备不再广播,这里必须说清楚,否则「未发现」会被误读成掉线
             row("链路:已连接 · \(ago(linkSince).replacingOccurrences(of: "前", with: ""))")
             row("设备:被 worker 占用(连接中不广播)")
-            if !lastTelemetry.isEmpty { row("遥测:" + String(lastTelemetry.prefix(60))) }
+            if let t = Self.formatTelemetry(lastTelemetry) { row("遥测:" + t) }
         } else if cfg.sessionDir == nil {
             // ⚠️ 没配 session-dir → pollSession() 直接 return,我们**根本没法知道**链路状态。
             //    这时候显示「未连接」是撒谎,而且是最坏的那种:worker 可能正连着,
@@ -788,7 +890,7 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
                     ? "设备:\(cfg.wanted) · \(lastRSSI) dBm · \(ago(lastSeen))"
                     : "设备:未发现 · \(scanning ? "扫描中" : "间歇等待")(\(Int(Self.scanWindow))s/\(Int(Self.scanIdle))s)")
             }
-            if !lastTelemetry.isEmpty { row("遥测:" + String(lastTelemetry.prefix(60))) }
+            if let t = Self.formatTelemetry(lastTelemetry) { row("遥测:" + t) }
         }
 
         menu.addItem(.separator())

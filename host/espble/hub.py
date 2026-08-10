@@ -161,6 +161,28 @@ class BleHub:
         for dl in list(self._links.values()):
             dl.link.start()
 
+    def adopt_registry(self, *, start: bool = True) -> List[str]:
+        """把注册表里已知的设备全部重新登记,返回这次新接管的 device_id。
+
+        ⚠️ 这个方法存在的理由:`__init__` 只是**打开**注册表,`_links` 是空的,
+        而 `start_all()` 遍历的也是 `_links`。也就是说 hub 进程一重启就"忘了"
+        所有设备,得靠调用方把 register 再走一遍 —— 而 supervisor 重启是常态
+        (launchd 拉起、改配置、崩溃恢复)。忘了调它的现象是:注册表里明明有设备,
+        菜单栏也列得出来,但没有任何 worker 在跑、一台都连不上。
+
+        幂等:register() 遇到已在 _links 里的 device_id 直接返回现有 link。
+        """
+        adopted = []
+        for rec in list(self.registry):
+            if rec.device_id in self._links:
+                continue
+            self.register(rec.device_id, rec.alias,
+                          device_type=rec.device_type, start=start)
+            adopted.append(rec.device_id)
+        if adopted:
+            _log(f"从注册表接管 {len(adopted)} 台:{', '.join(adopted)}")
+        return adopted
+
     # ---- 发送 ----
 
     def send(self, target: str, obj: Mapping[str, Any], *,
@@ -205,6 +227,18 @@ class BleHub:
         dl.channel.set_retained(key, obj)
         return True
 
+    def set_retained_all(self, key: str, obj: Mapping[str, Any]) -> List[str]:
+        """给**每台**设备设同一个 retained 状态,返回设到的设备 id。
+
+        看板这类"最新状态"就该用它:每台设备(重)连上都会被补推最新一帧。
+        fan-out 放在框架里而不是让每个消费方自己写 for 循环 —— broadcast() 已经是这个路子。
+        """
+        done = []
+        for dl in list(self._links.values()):
+            dl.channel.set_retained(key, obj)
+            done.append(dl.record.device_id)
+        return done
+
     def publish(self, target: str, obj: Mapping[str, Any]) -> bool:
         """发一条事件:进该设备的历史环,重连时以 live=false 重放。"""
         dl = self._resolve(target)
@@ -212,6 +246,20 @@ class BleHub:
             return False
         dl.channel.publish(obj)
         return True
+
+    def publish_all(self, obj: Mapping[str, Any]) -> List[str]:
+        """把一条事件发给**每台**设备,并进各自的历史环。
+
+        ⚠️ 别拿 broadcast() 代替这个。broadcast() 走 channel.send_now ——
+        只做"现在发出去"(加可选的离线排队),**不进历史环**;
+        而 publish() 才进历史环、重连时以 live=false 重放。
+        事件要的是后者:设备重连后应该能看到它离线期间错过的那几条。
+        """
+        done = []
+        for dl in list(self._links.values()):
+            dl.channel.publish(obj)
+            done.append(dl.record.device_id)
+        return done
 
     # ---- 状态 ----
 

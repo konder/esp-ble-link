@@ -257,6 +257,74 @@ def test_alias_binds_to_id_and_rejects_duplicates(hub):
         hub.alias("bbb222", "客厅")       # 重名会让路由无法确定
 
 
+def test_adopt_registry_rehydrates_after_restart(tmp_path, monkeypatch):
+    """hub 进程重启后必须能把注册表里的设备重新接管起来。
+
+    这是真实故障场景:launchd 拉起 / 改配置 / 崩溃恢复都会换进程。
+    没有 adopt_registry 的话现象很隐蔽 —— 注册表里有设备、菜单栏也列得出来,
+    但一个 worker 都没在跑、一台都连不上。
+    """
+    FakeLink.instances = []
+    monkeypatch.setattr(hubmod, "BleLink", FakeLink)
+    path, root = str(tmp_path / "d.json"), str(tmp_path / "s")
+    h1 = BleHub(app_path=str(tmp_path / "X.app"), device_type="m5paper",
+                registry_path=path, session_root=root)
+    h1.register("aaa111", alias="客厅")
+    h1.register("bbb222")
+    h1.close()
+
+    FakeLink.instances = []
+    h2 = BleHub(app_path=str(tmp_path / "X.app"), device_type="m5paper",
+                registry_path=path, session_root=root)
+    assert h2.status() == {}                          # 刚起来时确实什么都没接管
+    assert set(h2.adopt_registry()) == {"aaa111", "bbb222"}
+    assert set(h2.status()) == {"aaa111", "bbb222"}
+    assert len(FakeLink.instances) == 2               # 每台一个链路
+    assert all(l.started for l in FakeLink.instances)
+    # alias 和 type 得跟着回来,否则路由和广播名都会错
+    assert h2.registry.get("客厅").device_id == "aaa111"
+    assert all(l.device.device_name.startswith("m5paper-") for l in FakeLink.instances)
+    h2.close()
+
+
+def test_adopt_registry_is_idempotent(hub):
+    hub.register("aaa111")
+    n = len(FakeLink.instances)
+    assert hub.adopt_registry() == []                 # 已经在管的不重复接管
+    assert len(FakeLink.instances) == n               # 更不会重复起进程
+
+
+# ---- 全体 fan-out ----
+
+def test_set_retained_all_hits_everyone(hub):
+    a = hub.register("aaa111")
+    b = hub.register("bbb222")
+    assert set(hub.set_retained_all("usage", {"t": "usage", "rev": 7})) == {"aaa111", "bbb222"}
+    # retained 的语义是「(重)连上补推」,所以要在重连点上验。
+    # 补推走 send_blocking(见 _on_connect),不是 send_soon —— 所以看 blocking 不是 queued。
+    for dl in (a, b):
+        dl.link.blocking.clear()
+        dl.channel._on_connect(dl.link)
+        assert {"t": "usage", "rev": 7} in [json.loads(l) for l in dl.link.blocking]
+
+
+def test_publish_all_enters_every_history_ring(hub):
+    """publish_all 必须进历史环 —— 这正是它不能用 broadcast 代替的原因。
+
+    broadcast 走 channel.send_now,只做「现在发出去」;设备离线期间错过的事件
+    不会在重连后补上。事件要的恰恰是补上。
+    """
+    a = hub.register("aaa111")
+    b = hub.register("bbb222")
+    assert set(hub.publish_all({"t": "ev", "msg": "done"})) == {"aaa111", "bbb222"}
+    for dl in (a, b):
+        dl.link.blocking.clear()
+        dl.channel._on_connect(dl.link)               # 模拟重连
+        replayed = [json.loads(l) for l in dl.link.blocking]
+        assert any(r.get("msg") == "done" and r.get("live") is False for r in replayed), \
+            "重连后该以 live=false 重放,broadcast 做不到"
+
+
 def test_status_reports_每台(hub):
     hub.register("aaa111", alias="客厅")
     hub.register("bbb222")
