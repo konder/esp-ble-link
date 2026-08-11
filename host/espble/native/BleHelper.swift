@@ -671,29 +671,49 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
         hubDevices = out.sorted { $0.label < $1.label }
     }
 
-    /// 只读地判断一条链路的死活 + 最近一条遥测。尾部 32KB 足够。
+    /// 只读地判断一条链路的死活 + 最近一条遥测。
+    ///
+    /// ⚠️ 这里曾经只读**尾部 32KB**,注释还写着「32KB 足够」。那是错的,而且错得反直觉:
+    /// `connected` 事件**整条连接只写一次**(在文件很前面),而连接活着的每一秒都在往后面
+    /// 追加 notification / ack。所以**链路越健康、连得越久,connected 越确定地被挤出窗口**
+    /// —— 菜单栏就越确定地把一条好链路显示成「未连接」。
+    /// 实测:单连接稳定 3 小时 15 分钟(设备侧 c:1 d:0、遥测每 20 秒在落)之后,
+    /// 文件里堆了约 120KB,菜单栏显示「0/1 在线 · 未连接」。
+    ///
+    /// 之所以一直没暴露:以前链路一直在 flapping,worker 每几秒重开一次、
+    /// events.jsonl 每次都被截断,`connected` 永远就在尾部。**症状被 bug 藏在另一个 bug 后面。**
+    ///
+    /// 现在从尾部逐级放大窗口,直到找到一个 connect/disconnect 标记(或读完整个文件)。
+    /// 逐级而不是一次读全文:健康的长连接会让这个文件长到几 MB,而菜单栏是 2 秒一轮的。
     private func readLink(_ url: URL) -> (Bool, String) {
         guard let h = try? FileHandle(forReadingFrom: url) else { return (false, "") }
         defer { try? h.close() }
         let size = (try? h.seekToEnd()) ?? 0
-        try? h.seek(toOffset: size > 32768 ? size - 32768 : 0)
-        guard let d = try? h.readToEnd(), let text = String(data: d, encoding: .utf8) else {
-            return (false, "")
-        }
-        var connected = false
-        var telem = ""
-        for line in text.split(separator: "\n") {
-            if line.contains("\"event\":\"connected\"") { connected = true }
-            else if line.contains("\"event\":\"disconnected\"") { connected = false }
-            else if line.contains("\"event\":\"notification\"") {
-                if let r = line.range(of: "\"line\":\"") {
-                    telem = String(line[r.upperBound...])
-                        .replacingOccurrences(of: "\\\"", with: "\"")
-                        .replacingOccurrences(of: "\"}", with: "")
+
+        for window in [32_768, 512_000, Int(size)] {
+            let from = size > UInt64(window) ? size - UInt64(window) : 0
+            try? h.seek(toOffset: from)
+            guard let d = try? h.readToEnd(),
+                  let text = String(data: d, encoding: .utf8) else { return (false, "") }
+
+            var mark: Bool? = nil        // nil = 这个窗口里压根没有 connect/disconnect
+            var telem = ""
+            for line in text.split(separator: "\n") {
+                if line.contains("\"event\":\"connected\"") { mark = true }
+                else if line.contains("\"event\":\"disconnected\"") { mark = false }
+                else if line.contains("\"event\":\"notification\"") {
+                    if let r = line.range(of: "\"line\":\"") {
+                        telem = String(line[r.upperBound...])
+                            .replacingOccurrences(of: "\\\"", with: "\"")
+                            .replacingOccurrences(of: "\"}", with: "")
+                    }
                 }
             }
+            // 找到标记就用它;没找到而且窗口还没覆盖全文,就放大再来一遍。
+            if let m = mark { return (m, telem) }
+            if from == 0 { return (false, telem) }   // 全文都没有 → 真的没连过
         }
-        return (connected, telem)
+        return (false, "")
     }
 
     private func tick() {
