@@ -500,14 +500,21 @@ BLE 没有 MQTT 的 retained 和离线队列。用 `RetainedChannel`:
 **没用**。因为菜单栏配好之后 `needsScan` 恒为 false(`registryPath` 那行有硬编码兜底,
 永远不可能是 nil),它压根就没创建过 central,而扫描照样被掐死。
 
-**真成因是 bundle id 本身**,和 CoreBluetooth 用不用无关。三格对照实测(同一份二进制,
-同一个 worker,只改一个变量):
+**真成因是 bundle id 本身**,和 CoreBluetooth 用不用无关。
 
-| bundle id | 路径 | worker 扫到的设备数 |
+重复试验定性(**两边都开着菜单栏**,唯一变量是 bundle id;每次 `kill -9` worker
+逼一次重新发现,等 48 秒看 `discovered`;两块之间把 A/B 顺序对调,排除顺序假象):
+
+| 菜单栏的 bundle id | 试验次数 | worker 扫到的设备数 |
 |---|---|---|
-| 相同 | `~/Applications` | **0**(观察 2 分钟) |
-| 相同 | `/tmp` | **0** |
-| **不同**(`…​.monitor`) | `/tmp` | **1**,随即连上并 ack |
+| 与 worker **相同** | 4 | **0 / 0 / 0 / 0** —— 全败 |
+| **不同**(`….monitor`) | 4 | **4 / 5 / 1 / 4** —— 全胜 |
+
+⚠️ **为什么非要重复试验:这个现象有一个会骗人的瞬态。**
+`build-helper` 重编 bundle 之后,**第一个**从新 bundle 起的 worker 会卡在
+`central_created` 一两分钟(LaunchServices / Gatekeeper 重新评估),表现和本条一模一样。
+单次观察会把它误判成「换 id 没用」——**实际发生过**,而且当场得出了错结论。
+判别:等一会儿再试一次,或者看它最终是否自己走到 `central_state`。
 
 **判别方法**:把那个同 id 的进程杀掉,立刻重跑同一条扫描命令。
 ```
