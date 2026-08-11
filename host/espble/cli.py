@@ -104,7 +104,9 @@ def cmd_build_helper(args) -> int:
     # 菜单栏模式的默认值(写进 Info.plist);无界面 worker 不读它们
     for flag, val in (("--device-name", args.device_name),
                       ("--name-prefix", args.name_prefix),
-                      ("--session-dir", args.session_dir)):
+                      ("--session-dir", args.session_dir),
+                      ("--registry", args.registry),
+                      ("--session-root", args.session_root)):
         if val:
             cmd += [flag, val]
     if args.install:
@@ -241,6 +243,11 @@ def main(argv=None) -> int:
     p.add_argument("--device-name", help="菜单栏模式默认盯哪台设备(精确名)")
     p.add_argument("--name-prefix", help="菜单栏模式默认盯哪台设备(名字前缀)")
     p.add_argument("--session-dir", help="菜单栏模式只读地看哪个会话目录的链路状态")
+    # 这两个以前只有 build_helper.sh 认、命令行表达不出来 —— 于是重建时会静默丢掉
+    # Info.plist 里的这两项(退回 Swift 侧的硬编码默认值)。CLI 表达不了构建器支持的
+    # 东西就是个坑,所以补上。
+    p.add_argument("--registry", help="菜单栏模式读哪个设备注册表(hub 模式列设备清单用)")
+    p.add_argument("--session-root", help="菜单栏模式在哪找每台设备的会话目录")
     p.set_defaults(func=cmd_build_helper)
 
     p = sub.add_parser("scan", help="扫描周围的 BLE 设备(排查连不上的第一步)")
