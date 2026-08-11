@@ -200,14 +200,32 @@ if [[ $INSTALL -eq 1 ]]; then
   mkdir -p "$HOME/Applications"
   rm -rf "$HOME/Applications/$NAME.app"
   cp -R "$APP" "$HOME/Applications/"
-  # TCC 认的是 bundle id + 代码签名,不是路径,所以两份副本共用同一条授权。
+  # ★★ 装过去的这份**必须换一个 bundle id**。见 docs/pitfalls.md C10:
+  # **同一个 bundle id 的两个进程,后起的那个 CBCentralManager 一个 didDiscover
+  # 都收不到**(和它有没有创建 central 无关 —— 实测菜单栏压根不创建也照样掐死)。
+  # 菜单栏是常驻的,worker 是后起的,所以共用 id = worker 永远扫不到设备。
+  #
+  # 这里以前刻意共用 id,理由是「TCC 认 bundle id,两份副本共用一条授权」。
+  # 那个理由现在不成立也不需要:菜单栏模式是**只读文件显示器**,压根不碰
+  # CoreBluetooth(needsScan 恒为 false),不需要任何蓝牙授权。
+  MON_ID="$BUNDLE_ID.monitor"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $MON_ID" \
+      "$HOME/Applications/$NAME.app/Contents/Info.plist" >/dev/null
   echo "installed: $HOME/Applications/$NAME.app  (访达/启动台里可见,双击进菜单栏模式)"
+  echo "           bundle id 换成了 $MON_ID —— 和 worker 同 id 会掐死它的扫描(C10)"
 fi
 
 echo "built: $APP"
 echo "bundle id: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")"
 echo
-echo "下一步:**双击这个 app**(菜单栏模式),第一次会弹蓝牙授权框,点「允许」。"
+echo "下一步(首次授权,只做一次):"
+echo "  1. **双击上面 built 那个 app**(不是 ~/Applications 那份 —— 那份换了 bundle id,"
+echo "     拿它授权会授到 .monitor 上,worker 用不着)"
+echo "  2. 菜单里点「请求蓝牙授权」→ 弹框点「允许」"
+echo "  3. **授完就退出它**。它和 worker 同一个 bundle id,一直开着会让 worker"
+echo "     扫不到任何设备(C10)。日常要看状态请开 ~/Applications 那份。"
+echo
 echo "⚠️ 授权框只在 GUI(Aqua)会话里弹得出来,SSH 里 open 是弹不出来的 ——"
 echo "   但这只影响**第一次授权**;授过之后 Python/launchd 从 SSH 驱动都没问题。"
-echo "   另注:不带参数直接跑无界面 worker 是不会弹框的,它压根不碰 CoreBluetooth。"
+echo "   另注:菜单栏模式配好之后压根不碰 CoreBluetooth(needsScan 恒为 false),"
+echo "   所以它自己不会弹框 —— 这正是需要那个「请求蓝牙授权」菜单项的原因。"

@@ -528,18 +528,17 @@ final class MenuBarDelegate: NSObject, NSApplicationDelegate, CBCentralManagerDe
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         render()
-        // ★★ 只在**确实需要扫描**时才创建 CBCentralManager。见 docs/pitfalls.md C10。
+        // 只在**确实需要扫描**时才创建 CBCentralManager:配好之后(有注册表/会话文件)
+        // 菜单栏纯读文件,不碰 CoreBluetooth;只有全新安装(什么都没配)才建 ——
+        // 那时既要扫描,也正好需要弹 TCC 授权框(见 B1)。
         //
-        // 这里曾经无条件创建(只为了显示"蓝牙已授权"),后果很严重:
-        // **同一个 bundle 的两个进程只要都持有 CBCentralManager,后起的那个扫描就
-        // 一个结果都拿不到。** 于是菜单栏一开着,worker 就永远扫不到设备 →
-        // 连不上 → 自杀重启 → 看起来像链路在疯狂 flapping。
-        // 而"一个 bundle、N 个进程"正是 BleHub 多设备的基础,所以这条必须守住:
-        // **不需要扫描的进程,一个 central 都不要建。**
-        //
-        // 配好之后(有注册表/会话文件)菜单栏纯读文件,不碰 CoreBluetooth;
-        // 只有全新安装(什么都没配)才建 central —— 那时既要扫描,也正好需要弹 TCC 授权框
-        // (首次授权必须在 GUI 会话里创建 central 才弹得出来,见 B1)。
+        // ⚠️ **这一条不解决 C10,别以为它解决了。** 曾经有一版按「持有 central 就会
+        // 掐死别人的扫描」这个(错的)成因,把这里从无条件创建改成按需创建,并当成
+        // C10 的修复 —— 没用。真成因是 **bundle id**:同一个 id 的两个进程,后起的
+        // 那个一个 didDiscover 都收不到,和有没有创建 central 无关(实测菜单栏
+        // needsScan 恒为 false、压根没建过 central,扫描照样被掐死)。
+        // 所以真正的约束是「一个 bundle id 同时只跑一个进程」——
+        // 菜单栏用独立 id(build-helper --install 会改成 <id>.monitor)。详见 C10。
         if needsScan {
             central = CBCentralManager(delegate: self, queue: nil)
         }
