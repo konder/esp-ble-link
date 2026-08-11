@@ -393,6 +393,30 @@ helper —— 必须**按 session-dir 匹配**,它每个会话唯一。
 装了 EDR 类安全软件的机器(典型是公司配发的电脑)会 SIGKILL adhoc 自签二进制。
 构建能过、一运行就没。换台机器构建和运行,别在这上面浪费时间。
 
+### B9. ★★ helper 崩掉之后**永久**失联,日志一直刷「keepalive 失败 → 触发重连」
+
+**成因**:「连没连上」只看事件流,而崩掉的进程写不出 `disconnected` 事件。
+
+`HelperSession.connected` 曾经是 `_connected and not _dead`,两个标志都只由
+`events.jsonl` 里的事件驱动。helper 被 `kill -9`(或自己崩)时它压根没机会写那条
+`disconnected` —— 于是 `_connected` 永远是 True,`link.py` 那条
+「`session is None or not session.connected` 才重开」的判据**永远不成立**。
+
+更阴的是日志看起来在自愈:keepalive 探测确实发现链路死了、打出「触发重连」,
+但那一行**只是打印**,代码什么都没做(发送失败那条同样只 `break` 出内层循环)。
+实测 `kill -9` worker 之后 **3.5 分钟零恢复**,期间日志刷了 7 遍「触发重连」。
+
+**判别**:`pgrep -f "<HelperName> --session-dir"` 一个都没有,而 Python 侧既不报
+「连接失败」也不重开 —— 说明它以为还连着。
+
+**结论**:进程存活是**独立的一条判据**,必须和事件流并列查。
+`check_process_alive()` 由监护方每轮调(节流 2s,因为 `_pids()` 要 fork 一个 `ps`),
+而且**只在已经连上之后才查** —— 启动阶段进程还没出现(坑 2),那时查会得到
+「已退出」,进而 kill 掉正要起来的 helper,永不收敛。
+
+顺带一条通用的:**日志说了「要做 X」,就得真的做 X。** 就是「触发重连」这行字
+让这个 bug 活了很久 —— 每次翻日志都以为恢复机制在转。
+
 ---
 
 ## C. 中枢侧 —— 连接与收发

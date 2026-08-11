@@ -213,3 +213,44 @@ def test_start_fails_clearly_when_helper_not_built(session):
     assert session.start() is False
     assert "helper 未编译" in session.last_error
     assert session.fatal          # 没编译不是「等一等就好」的错误
+
+
+# ---- 进程消失(helper 崩了/被 kill -9,没机会写 disconnected)----
+
+def test_a_vanished_helper_counts_as_disconnected(session):
+    """这条是补一个真事故:kill -9 worker 之后 3.5 分钟零恢复。
+
+    成因是 connected 只看事件流,而崩掉的进程压根写不出 disconnected 事件。
+    """
+    emit(session, event="connected", name="Dev", chunk=180)
+    session.poll()
+    assert session.connected
+
+    session.alive = lambda: False          # 进程没了,事件流里一个字都没多
+    assert session.check_process_alive() is False
+    assert session.connected is False      # ← 以前这里是 True,于是永不重开
+    assert "进程消失" in session.last_error
+
+
+def test_liveness_is_not_checked_before_the_first_connect(session):
+    """启动阶段不能判存活:open 一收下请求就返回,进程还没出现(坑 2)。
+
+    那时判「已退出」会触发重连,而重连时的 kill 又把正要起来的 helper 杀掉 ——
+    永不收敛。所以这里连 alive() 都不该被调到。
+    """
+    session.alive = lambda: pytest.fail("连上之前不该查存活")
+    assert session.check_process_alive() is True
+
+
+def test_liveness_check_is_throttled(session):
+    # _pids() 要 fork 一个 ps,而监护循环 0.2s 一轮 —— 不节流就是每秒 5 次 fork
+    emit(session, event="connected", name="Dev", chunk=180)
+    session.poll()
+    calls = []
+    session.alive = lambda: (calls.append(1), True)[1]
+
+    session.check_process_alive(now=1000.0)
+    session.check_process_alive(now=1001.0)     # 1 秒后:还在节流窗口内
+    assert len(calls) == 1
+    session.check_process_alive(now=1002.5)     # 超过 2 秒:该查了
+    assert len(calls) == 2

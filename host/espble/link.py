@@ -169,6 +169,12 @@ class BleLink:
         while not self._stop.is_set():
             session = self._session
 
+            # helper 崩了/被杀时不会写 disconnected 事件,所以「连没连上」不能只信
+            # 事件流 —— 还得看进程在不在。这一步之前是缺的,后果是 helper 一崩就
+            # 永久失联(实测 kill -9 后 3.5 分钟零恢复)。节流在 session 那边。
+            if session is not None and not session.check_process_alive():
+                _log(f"{session.last_error} —— 重开")
+
             if session is None or not session.connected:
                 self._drop_session()
                 session = HelperSession(self.device,
@@ -206,6 +212,11 @@ class BleLink:
                         _log(f"on_connect 回调抛异常: {exc!r}")
 
             # 排空发件箱
+            #
+            # ⚠️ 发失败必须**真的**丢掉 session。以前这里只 break 跳出内层循环,
+            #    日志写着「并重连」而重连压根没发生 —— 因为顶上那个重开判据看的是
+            #    `session.connected`,而 helper 活着时它一直是 True。
+            failed = False
             while not self._stop.is_set() and session.connected:
                 with self._outbox_lock:
                     if not self._outbox:
@@ -213,7 +224,11 @@ class BleLink:
                     line = self._outbox.popleft()
                 if not session.send_line(line):
                     _log(f"发送失败({session.last_error or '链路断了'}) —— 丢弃本条并重连")
+                    failed = True
                     break
+            if failed:
+                self._drop_session()
+                continue
 
             # 收 notify
             while session.notifications:
@@ -236,7 +251,12 @@ class BleLink:
                     payload = None
                     _log(f"keepalive_provider 抛异常: {exc!r}")
                 if payload and not session.send_line(payload):
+                    # 同上:以前这行日志是假的 —— 它说「触发重连」,而代码什么都没做。
+                    # keepalive 是唯一能探出「helper 活着但链路已经死了」的手段,
+                    # 探出来了却不动,等于白探。
                     _log("keepalive 失败 → 触发重连")
+                    self._drop_session()
+                    continue
 
             self._stop.wait(0.2)
 

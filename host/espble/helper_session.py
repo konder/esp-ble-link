@@ -134,6 +134,7 @@ class HelperSession:
         self._fatal = False       # TCC 未授权之类:重试无意义,要人来处理
         self._last_error = ""
         self._acked: set = set()
+        self._last_alive_check = 0.0   # _pids() 要 fork 一个 ps,得节流(见 poll)
         self.peer_name = ""
         self.chunk_size = 0
         # 设备 notify 上来的行。send_line 内部也会 poll,所以通知必须缓冲在这里,
@@ -293,6 +294,42 @@ class HelperSession:
                     _log(f"event_sink 抛异常: {exc!r}")
             events.append(event)
         return events
+
+    def check_process_alive(self, now: Optional[float] = None) -> bool:
+        """进程没了就是链路没了 —— 哪怕事件流里一个字都没说。
+
+        返回 **False 只表示「本次探测发现进程消失了」**(并顺手把 session 标死)。
+        探测不适用时(还没连上、或已经知道它死了)返回 True —— 那两种情况本来就由
+        `connected` 那条判据管,这里再报一次 False 只会让上层重复打日志。
+
+        **由监护方(link.py)调,不在 poll() 里自动跑** —— 本层只管「和一个 helper
+        说话」,什么时候重开进程是上层的事(见文件头)。节流和「只在连上之后才判」
+        这两条规则放在这里,是因为它们和 `_pids()` 是一码事。
+
+        为什么必须有这一步:`connected` 以前只看事件流,而 helper **崩掉或被 kill -9
+        时压根不会写 `disconnected` 事件**(它自己都没机会跑)。于是 `_connected`
+        永远是 True,link.py 的「session 没连上就重开」那个判据永远不成立 ——
+        **helper 一崩就永久失联**。实测:`kill -9` worker 之后 3.5 分钟零恢复,
+        日志只在刷「keepalive 失败 → 触发重连」,而那句话当时是假的。
+
+        ⚠️ 只在**已经连上之后**才判。启动阶段进程还没出现(`open` 一收下请求就返回,
+        见文件头坑 2),那时候判存活会得到「已退出」→ 触发重连 → 重连时的 kill
+        又把正要起来的 helper 杀掉 → 永不收敛。start() 里那个轮询等待才是启动阶段的判据。
+
+        ⚠️ 节流:`_pids()` 要 fork 一个 `ps -ax`,而监护循环 0.2s 一轮。
+        不节流就是每秒 5 次 fork。2 秒一次足够 —— 重连本身就是 5 秒起步的量级。
+        """
+        if not self._connected or self._dead:
+            return True
+        now = time.time() if now is None else now
+        if now - self._last_alive_check < 2.0:
+            return True
+        self._last_alive_check = now
+        if not self.alive():
+            self._dead = True
+            self._last_error = "helper 进程消失了(崩溃或被杀),没来得及写 disconnected"
+            return False
+        return True
 
     def _absorb(self, event: dict):
         kind = event.get("event")
