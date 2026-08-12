@@ -171,10 +171,19 @@ def test_default_unicast_drops_offline_broadcast_queues(hub):
 
     hub.send("aaa111", {"t": "usage"})            # 单点 → 丢
     assert a.link.queued == []
+    assert len(a.channel._pending) == 0
 
     hub.broadcast({"t": "cmd", "cmd": "ota"})     # 广播 → 排队
-    assert len(a.link.queued) == 1
-    assert a.link.queued[0][1] is True            # queue_while_offline
+    # ⚠️ 排在 **channel 层**,不在 link 的 outbox。这条以前断言的是 outbox ——
+    #    而 _on_connect 会 clear_outbox(),指令一连上就被清掉。断言错了层,
+    #    所以用例一直绿着、功能一直坏着。
+    assert a.link.queued == []
+    assert len(a.channel._pending) == 1
+
+    # 而且必须真的在重连后送出去 —— 这才是「值得等」的意思
+    a.link.connected = True
+    a.channel._on_connect(a.link)
+    assert any(json.loads(x) == {"t": "cmd", "cmd": "ota"} for x in a.link.blocking)
 
 
 def test_policy_is_configurable(tmp_path, monkeypatch):
@@ -187,9 +196,10 @@ def test_policy_is_configurable(tmp_path, monkeypatch):
     a = h.register("aaa111")
     a.link.connected = False
     h.send("aaa111", {"t": "usage"})
-    assert len(a.link.queued) == 1                # 反过来了
-    a.link.queued.clear()
+    assert len(a.channel._pending) == 1           # 反过来了(排队的都在 channel 层)
+    a.channel._pending.clear()
     h.broadcast({"t": "cmd"})
+    assert len(a.channel._pending) == 0
     assert a.link.queued == []
     h.close()
 
@@ -198,7 +208,7 @@ def test_per_call_override_beats_default(hub):
     a = hub.register("aaa111")
     a.link.connected = False
     hub.send("aaa111", {"t": "usage"}, queue_offline=True)
-    assert len(a.link.queued) == 1
+    assert len(a.channel._pending) == 1
 
 
 # ---- hello / 注册 ----

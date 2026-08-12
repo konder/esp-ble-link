@@ -146,11 +146,53 @@ def test_immediate_messages_dropped_while_offline(link, channel):
     assert len(channel._history) == 1
 
 
-def test_send_now_can_opt_into_queueing(link, channel):
+def test_offline_commands_queue_in_the_channel_not_the_link_outbox(link, channel):
+    """这条以前断言的是 `len(link.queued) == 1` —— 也就是**bug 所在的那一层**。
+
+    指令进了 link 的 outbox,而 `_on_connect` 开头就 clear_outbox() ——
+    于是它在连上的那一刻被清掉。用例一直绿着、功能一直坏着,因为它从没验过
+    「重连之后指令还在不在」。正确的断言是:排在**本层**,不在 outbox。
+    """
     link.connected = False
     channel.send_now({"t": "cmd", "cmd": "ota"}, queue_while_offline=True)
-    assert len(link.queued) == 1          # 指令值得等
-    assert len(channel._history) == 0     # 但不进历史
+    assert len(channel._pending) == 1      # 指令值得等,排在 channel 这一层
+    assert link.queued == []               # **不在** outbox(否则会被 clear 掉)
+    assert len(channel._history) == 0      # 也不进历史
+
+
+def test_a_queued_command_survives_reconnect_and_gets_delivered(link, channel):
+    """真正的回归用例:离线排队的指令必须在重连后真的送出去。"""
+    link.connected = False
+    channel.send_now({"t": "cmd", "cmd": "ota"}, queue_while_offline=True)
+
+    link.connected = True
+    channel._on_connect(link)              # 模拟重连(内部会 clear_outbox)
+
+    sent = [json.loads(x) for x in link.blocking]
+    assert {"t": "cmd", "cmd": "ota"} in sent, "指令被 clear_outbox 吃掉了"
+    assert len(channel._pending) == 0      # 送成了就出队
+
+
+def test_queued_command_goes_out_after_retained_and_history(link, channel):
+    # 顺序要紧:ota 会让设备重启,先把状态和列表补对再执行动作,
+    # 否则设备带着旧状态重启
+    channel.set_retained("state", {"t": "state", "rev": 9})
+    channel.publish({"t": "ev", "n": 1})
+    link.connected = False
+    channel.send_now({"t": "cmd", "cmd": "ota"}, queue_while_offline=True)
+
+    link.connected = True
+    link.blocking.clear()
+    channel._on_connect(link)
+    assert [json.loads(x)["t"] for x in link.blocking] == ["state", "ev", "cmd"]
+
+
+def test_a_command_that_cannot_be_sent_stays_queued(link, channel):
+    link.connected = False
+    channel.send_now({"t": "cmd", "cmd": "ota"}, queue_while_offline=True)
+    channel._on_connect(link)              # 链路其实还断着,补推会失败
+    # 没送成就得留着 —— 丢了等于永久递不进去(设备可能几小时才连上一次)
+    assert len(channel._pending) == 1
 
 
 def test_keepalive_uses_retained_frame(link, channel):

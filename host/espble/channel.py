@@ -48,6 +48,10 @@ class RetainedChannel:
         self._lock = threading.Lock()
         self._retained: Dict[str, dict] = {}
         self._history: collections.deque = collections.deque(maxlen=history_n)
+        # 「值得等」的指令(ota 之类)。**必须存在这一层,不能只丢进 link 的 outbox** ——
+        # _on_connect 会 clear_outbox(),那样指令在连上的那一刻就被清掉了。
+        # 成因详见 send_now / _on_connect 的注释。
+        self._pending: collections.deque = collections.deque(maxlen=16)
 
         link.on_connect = self._on_connect
         link.keepalive_provider = self._keepalive_line
@@ -79,8 +83,24 @@ class RetainedChannel:
         """一次性消息:不进历史、不 retained。断连时默认直接丢。
 
         queue_while_offline=True 用于「值得等」的指令(例如 ota),它们排队等重连。
+
+        ⚠️ 排队的指令存在**本层**的 `_pending` 里,而不是丢进 link 的 outbox。
+        以前是后者,而 `_on_connect` 开头就 `clear_outbox()` —— 于是「离线排队的
+        指令」在连上的**那一刻**被清掉,永远送不出去。那个 clear 对状态帧和事件是
+        对的(retained/history 会覆盖它们),但**指令既不在 retained 也不在 history
+        里,清掉就是永久丢失**。实测代价:设备每 1.7 小时才连上一次时,ota 指令
+        怎么都递不进去,而日志上看不出任何异常。
         """
-        self.link.send_soon(self._encode(obj), queue_while_offline=queue_while_offline)
+        if queue_while_offline and not self.link.connected:
+            with self._lock:
+                self._pending.append(dict(obj))
+            return
+        if not self.link.send_soon(self._encode(obj),
+                                   queue_while_offline=queue_while_offline):
+            # 刚才还连着、这一瞬间断了。值得等的指令别丢,转入 _pending。
+            if queue_while_offline:
+                with self._lock:
+                    self._pending.append(dict(obj))
 
     def close(self):
         self.link.close()
@@ -115,8 +135,11 @@ class RetainedChannel:
         with self._lock:
             retained = list(self._retained.values())
             history = list(self._history)
-        # 断连期间攒下的即时消息作废 —— 它们的内容已经被 retained/history 覆盖了,
+            pending = list(self._pending)
+            self._pending.clear()
+        # 断连期间攒下的**即时**消息作废 —— 它们的内容已经被 retained/history 覆盖了,
         # 不清掉就会和下面的补推重复。
+        # ⚠️ 指令不在此列:它们存在 _pending 里(见 send_now),不受这个 clear 影响。
         link.clear_outbox()
 
         for obj in retained:
@@ -124,3 +147,10 @@ class RetainedChannel:
         for obj in history:      # 旧 → 新
             if not link.send_blocking(self._encode(self.replay_transform(obj))):
                 break            # 链路又断了,剩下的下次重连再补
+        # 指令放最后:先让设备的状态和列表是对的,再让它去执行动作
+        # (ota 会让设备重启,顺序反了它就带着旧状态重启了)。
+        for obj in pending:
+            if not link.send_blocking(self._encode(obj)):
+                with self._lock:            # 没送成就放回去,下次重连再试
+                    self._pending.appendleft(obj)
+                break
